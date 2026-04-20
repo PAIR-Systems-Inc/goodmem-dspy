@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dspy-goodmem"
+version = "0.1.0"
+description = "GoodMem integration for DSPy — a self-hosted memory backend for agents"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Mohamed Khalid Khalil", email = "mohammed.khalid@pairsys.ai" }]
+requires-python = ">=3.10"
+keywords = ["dspy", "goodmem", "rag", "llm", "vector-memory", "retriever", "agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "dspy>=2.5.0",
+    "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+examples = ["python-dotenv>=1.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/PAIR-Systems-Inc/dspy-goodmem"
+Repository = "https://github.com/PAIR-Systems-Inc/dspy-goodmem"
+Issues = "https://github.com/PAIR-Systems-Inc/dspy-goodmem/issues"
+"GoodMem Docs" = "https://docs.goodmem.ai"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dspy_goodmem"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "C",   # flake8-comprehensions
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "RUF", # ruff-specific rules
+    "Q",   # flake8-quotes
+]
+ignore = [
+    "B027",   # Allow non-abstract empty methods in abstract base classes
+    "C901",   # Ignore complexity checking
+    "E501",   # Ignore line length errors (handled by formatter)
+    "UP035",  # Allow python typing modules
+    "B904",   # Allow raise custom exceptions in except blocks
+    "RUF022", # Allow unsorted __all__ value
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint.isort]
+known-first-party = ["dspy_goodmem"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",   # Allow assert statements in tests
+    "ARG001", # Allow unused arguments in tests (pytest fixtures)
+]
+"__init__.py" = ["F401"]
