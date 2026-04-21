@@ -5,10 +5,10 @@ across four scenarios that highlight different agent capabilities:
 
     Scenario 1 -- Conversational memory agent
         A ReAct agent handles a sequence of turns. It stores facts
-        the user shares via goodmem_create_memory, then retrieves
-        them via goodmem_retrieve_memories when asked follow-up
-        questions. Each turn is an independent ReAct call -- memory
-        lives in GoodMem, not in the agent.
+        the user shares via create_memory, then retrieves them via
+        retrieve_memories when asked follow-up questions. Each turn
+        is an independent ReAct call -- memory lives in GoodMem, not
+        in the agent.
 
     Scenario 2 -- Cross-agent memory persistence
         A brand-new ReAct agent (no prior calls, no conversation
@@ -167,10 +167,10 @@ SCENARIO_3_QUESTION = "Show me only the facts whose category is 'hobby'."
 class MemoryAssistant(dspy.Signature):
     """You are a personal assistant with access to a semantic memory store via GoodMem tools.
 
-    When the user shares a fact about themselves, call goodmem_create_memory to store it
+    When the user shares a fact about themselves, call create_memory to store it
     as a memory in the GoodMem space given by space_id.
 
-    When the user asks a question about themselves, call goodmem_retrieve_memories to
+    When the user asks a question about themselves, call retrieve_memories to
     search that same space_id before answering.  Always call a GoodMem tool rather than
     relying on your own memory.
     """
@@ -186,7 +186,7 @@ class MemoryAnalyst(dspy.Signature):
     The user's memories live in the GoodMem space given by space_id.  Each memory has a
     'category' field in its metadata (one of: 'work', 'hobby', 'personal').
 
-    When the user asks about a specific category, call goodmem_list_memories to fetch
+    When the user asks about a specific category, call list_memories to fetch
     every memory in the space and filter them by the metadata.category field yourself.
     Do not rely on semantic search alone.
     """
@@ -318,7 +318,7 @@ def scenario_2_cross_agent_memory(tools: list, space_id: str) -> None:
 
     Spins up a brand-new ReAct agent and asks it what it knows about
     the user.  The only way it can answer is by calling
-    goodmem_retrieve_memories against the shared space.
+    retrieve_memories against the shared space.
     """
     section("Scenario 2: Cross-agent memory persistence")
     print("  (Building a fresh ReAct agent with no prior calls.)")

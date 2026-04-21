@@ -1,7 +1,7 @@
 """GoodMem + DSPy RAG Pipeline Example.
 
 Demonstrates how to build a retrieval-augmented generation (RAG) system
-using GoodMem as the vector memory backend and DSPy for the LM pipeline.
+using GoodMem as the self-hosted retrieval backend and DSPy for the LM pipeline.
 
 The example walks through every step:
 
@@ -164,7 +164,7 @@ def setup_goodmem(client: GoodMemClient) -> tuple[str, list[str]]:
     embedders = client.list_embedders()
     if not embedders:
         sys.exit(
-            "Error: No embedders registered on the GoodMem server.\nRegister one first — see https://docs.goodmem.ai"
+            "Error: No embedders registered on the GoodMem server.\nRegister one first; see https://docs.goodmem.ai"
         )
 
     embedder = embedders[0]
@@ -238,7 +238,7 @@ class RAG(dspy.Module):
     def forward(self, question: str) -> dspy.Prediction:
         # Step 1: Retrieve relevant passages from GoodMem.
         # GoodMemRM.forward() returns a list of dotdict({"long_text": ...})
-        # objects — the same format used by all DSPy retrievers.
+        # objects, the same format used by all DSPy retrievers.
         passages = self.retriever(question)
 
         # Step 2: Combine passages into a single context string.
@@ -290,8 +290,8 @@ def evaluate_quality(rag: RAG) -> float:
       - **dspy.Example**: A labeled data point with input fields and gold
         outputs, used for evaluation (and optionally for optimization).
       - **SemanticF1**: A metric that uses an LM to judge how well the
-        predicted answer captures the meaning of the gold answer —
-        more robust than exact-match for free-form text.
+        predicted answer captures the meaning of the gold answer. More
+        robust than exact-match for free-form text.
       - **dspy.Evaluate**: Runs a module over a dataset, computes the
         metric for each example, and reports aggregate scores.
     """
@@ -321,7 +321,7 @@ def evaluate_quality(rag: RAG) -> float:
     ]
 
     # SemanticF1 breaks the predicted and gold answers into atomic facts
-    # and measures overlap — like F1, but at the semantic level.
+    # and measures overlap, like F1 but at the semantic level.
     metric = SemanticF1(decompositional=True)
 
     # Evaluate the RAG module on the dev set.

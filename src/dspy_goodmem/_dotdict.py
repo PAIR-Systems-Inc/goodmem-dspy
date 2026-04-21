@@ -1,7 +1,7 @@
 """Vendored copy of ``dspy.dsp.utils.dotdict``.
 
 Vendored because ``dspy.dsp.utils`` is DSPy-internal and not part of its
-public API — importing it directly risks breakage on DSPy internal
+public API, so importing it directly risks breakage on DSPy internal
 refactors.  The class itself is a trivial ``dict`` subclass that exposes
 items as attributes; ``GoodMemRM`` uses it to match the return shape
 expected by ``dspy.Retrieve``.

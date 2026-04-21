@@ -2,11 +2,7 @@
 
 Provides :class:`GoodMemRM`, a ``dspy.Retrieve`` subclass that performs
 semantic retrieval against one or more GoodMem spaces and returns results
-in the ``dotdict({"long_text": ...})`` format expected by
-``dspy.configure(rm=...)``.
-
-Follows the same patterns as :mod:`dspy.retrievers.weaviate_rm` (dotdict
-return) and :mod:`dspy.retrievers.databricks_rm` (HTTP via ``requests``).
+as ``dotdict({"long_text": ...})`` passages.
 
 Example::
 
@@ -16,11 +12,10 @@ Example::
         space_ids=["<space-uuid>"],
         api_key="gm_...",
         base_url="https://localhost:8080",
+        k=3,
+        verify_ssl=False,  # localhost self-signed cert; remove for a server with a valid TLS cert
     )
-    dspy.configure(rm=rm)
-
-    retrieve = dspy.Retrieve(k=3)
-    passages = retrieve("What is the main finding?").passages
+    passages = rm("What is the main finding?")
 """
 
 from __future__ import annotations

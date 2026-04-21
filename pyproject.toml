@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "dspy-goodmem"
 version = "0.1.0"
-description = "GoodMem integration for DSPy — a self-hosted memory backend for agents"
+description = "GoodMem integration for DSPy"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Mohamed Khalid Khalil", email = "mohammed.khalid@pairsys.ai" }]

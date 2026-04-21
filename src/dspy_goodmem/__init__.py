@@ -1,7 +1,7 @@
 """GoodMem integration for DSPy.
 
 Provides a retriever, HTTP client, and tool factory for using GoodMem
-(https://goodmem.ai) as a memory backend in DSPy pipelines and agents.
+(https://goodmem.ai), a self-hosted RAG system, in DSPy pipelines and agents.
 
 Main exports:
     GoodMemRM: DSPy retriever backed by GoodMem semantic search
