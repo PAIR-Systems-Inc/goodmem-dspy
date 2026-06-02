@@ -1,4 +1,4 @@
-# dspy-goodmem
+# goodmem-dspy
 
 [![PyPI](https://img.shields.io/pypi/v/dspy-goodmem.svg)](https://pypi.org/project/dspy-goodmem/)
 [![Python](https://img.shields.io/pypi/pyversions/dspy-goodmem.svg)](https://pypi.org/project/dspy-goodmem/)
