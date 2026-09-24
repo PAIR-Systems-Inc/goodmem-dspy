@@ -148,13 +148,13 @@ Reproduced against the published 0.1.1 wheel, live against GoodMem v1.0.320.
 | `list_spaces` returned the first page; `nextToken` appeared nowhere | Paginated, bounded by `max_list_items` |
 | No metadata filtering | `filters`, escaped and type-correct |
 | Content type guessed from the **host's** `/etc/mime.types`, so the same file could upload as a different type on another machine — and the package's own test for it failed on this one | The SDK decides; content is decoded by the type the server reports |
-| 62 tests patching `requests`, green against every defect; no CI | 52 offline + 19 live; CI on 3.10–3.13 |
+| 62 tests patching `requests`, green against every defect; no CI | 55 offline + 19 live; CI on 3.10–3.13 |
 
 ## Tests
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_dspy_goodmem.py` | 52 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
+| `tests/test_dspy_goodmem.py` | 55 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
 | `tests/test_dspy_goodmem_live.py` | 19 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
