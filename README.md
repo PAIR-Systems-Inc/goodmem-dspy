@@ -1,132 +1,184 @@
-# goodmem-dspy
+# dspy-goodmem
 
-[![PyPI](https://img.shields.io/pypi/v/dspy-goodmem.svg)](https://pypi.org/project/dspy-goodmem/)
-[![Python](https://img.shields.io/pypi/pyversions/dspy-goodmem.svg)](https://pypi.org/project/dspy-goodmem/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[GoodMem](https://docs.goodmem.ai) memory for [DSPy](https://github.com/stanfordnlp/dspy):
+a retriever and a set of agent tools. Documents are chunked, embedded and
+searched server-side; this package wraps the official `goodmem` Python SDK.
 
-[GoodMem](https://goodmem.ai) integration for [DSPy](https://dspy.ai).
+**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
 
-GoodMem is a self-hosted RAG system which handles the full retrieval pipeline: ingestion, chunking, embedding, storage, hybrid search, reranking, and summarization. This package wraps it for DSPy so you can:
-
-- Plug `GoodMemRM` into any DSPy pipeline through the standard `dspy.Retrieve` interface.
-- Hand GoodMem's full memory lifecycle to a `dspy.ReAct` agent as callable tools.
-- Use `GoodMemClient` directly when you want control over the REST API.
+> **Upgrading from 0.1.1.** 0.1.1 talked to GoodMem over hand-written HTTP. A
+> retrieval that *failed* — a space whose embedder was unavailable, say —
+> returned `success: true` with zero results and no indication anything had
+> gone wrong, indistinguishable from an empty index. See
+> [Changes in 0.2.0](#changes-in-020).
 
 ## Install
 
 ```bash
 pip install dspy-goodmem
+export GOODMEM_API_KEY="gm_your_key_here"
+export GOODMEM_BASE_URL="https://your-goodmem-server"
 ```
 
-A running GoodMem server is required. See the [Quick Start](https://goodmem.ai/quick-start) for deployment instructions.
-
-## Retriever usage
+## Retrieve
 
 ```python
 import dspy
 from dspy_goodmem import GoodMemRM
 
-dspy.configure(lm=dspy.LM("openai/gpt-5-mini"))
+rm = GoodMemRM(space_ids=["<space-uuid>"], k=3)
+dspy.settings.configure(rm=rm)
 
-rm = GoodMemRM(
-    space_ids=["<your-space-uuid>"],
-    api_key="gm_...",
-    base_url="https://localhost:8080",
-    k=3,
-    verify_ssl=False,  # localhost self-signed cert; remove for a server with a valid TLS cert
-)
-
-class RAG(dspy.Module):
-    def __init__(self, retriever):
-        super().__init__()
-        self.retriever = retriever
-        self.respond = dspy.ChainOfThought("context, question -> response")
-
-    def forward(self, question):
-        passages = self.retriever(question)
-        context = "\n\n".join(p["long_text"] for p in passages)
-        return self.respond(context=context, question=question)
-
-rag = RAG(retriever=rm)
-print(rag(question="Summarize what's in the knowledge base.").response)
+passages = rm("What is the main finding?").passages
 ```
 
-## Agent usage
+Each passage is a `dotdict` carrying `long_text` — what DSPy consumes —
+alongside the data 0.1.1 discarded:
 
-`make_goodmem_tools` returns 11 plain callables covering every GoodMem operation: full CRUD for spaces, create/list/get/delete for memories, plus semantic retrieval and embedder discovery. Wrap them in `dspy.Tool` and a `dspy.ReAct` agent can manage its own memory end to end instead of only reading from it.
+```python
+{
+  "long_text": "...",         # the chunk text
+  "score": 0.64,              # higher is better
+  "raw_score": -0.64,         # exactly what the server sent
+  "score_kind": "vector",     # or "reranker" -- not the same scale
+  "chunk_id": "...", "memory_id": "...", "space_id": "...",
+  "metadata": {...},          # the memory's metadata, joined by UUID
+  "goodmem_partial": False,   # True when the server reported a problem
+}
+```
+
+### When retrieval goes wrong
+
+A degraded retrieval still returns whatever passages arrived, each flagged
+with `goodmem_partial`. A `dspy.Prediction` has no slot for a flag on an
+*empty* result, so a degraded retrieval that returns nothing raises a
+`UserWarning` and logs at WARNING with the server's own reason — rather than
+looking like a clean miss:
+
+```
+UserWarning: GoodMem reported a problem during retrieval and returned no
+passages -- this is not an empty index: EMBEDDER_FAILED: Embedding failed
+```
+
+### Scores
+
+GoodMem produces two kinds of score and they are not comparable. **Vector**
+scores are negative distances, so `score` is the flipped value with
+`raw_score` kept beside it. **Reranker** scores are already higher-is-better,
+on a **provider-dependent** scale — measured live on the same five documents,
+Voyage `rerank-2.5` returned `0.27..0.93` and Jina `jina-reranker-v3` returned
+`-0.14..0.43`.
+
+So there is **no default threshold**; `min_score` applies only when
+`reranker_id` is set, and warns naming the observed range if it removes
+everything.
+
+## Agent tools
 
 ```python
 import dspy
 from dspy_goodmem import GoodMemClient, make_goodmem_tools
 
-dspy.configure(lm=dspy.LM("openai/gpt-5-mini"))
+client = GoodMemClient()
+tools = make_goodmem_tools(client, space_ids=["<space-uuid>"])
+agent = dspy.ReAct("question -> answer", tools=[dspy.Tool(t) for t in tools])
+```
 
-client = GoodMemClient(
-    api_key="gm_...",
-    base_url="https://localhost:8080",
-    verify_ssl=False,  # localhost self-signed cert; remove for a server with a valid TLS cert
+By default the agent gets exactly two tools — `goodmem_search(query, top_k)`
+and `goodmem_remember(text)`. The model never chooses a space. 0.1.1 handed it
+eleven, including `delete_space` and a `public_read` argument the server
+rejects.
+
+| Argument | Adds |
+| --- | --- |
+| `allow_upload=True` | `goodmem_upload_file`, confined to the client's `upload_dir` |
+| `allow_admin=True` | space/embedder management and `get_memory` |
+| `allow_delete=True` | `delete_memory`, `delete_space` |
+| `allow_write=False` | removes `goodmem_remember` |
+
+## Metadata filters
+
+Filters are expressions evaluated server-side, not SQL. Build them with the
+`filters` helper rather than by string interpolation:
+
+```python
+from dspy_goodmem import GoodMemRM, filters
+
+rm = GoodMemRM(space_ids=["..."], metadata_filter={"tenant": "acme", "active": True})
+
+expression = filters.all_of(
+    filters.equals("tenant", "acme"),
+    filters.compare("year", ">=", 2026),
 )
-tools = [dspy.Tool(fn) for fn in make_goodmem_tools(client)]
-
-agent = dspy.ReAct("task -> result", tools=tools)
-agent(task="Remember that the user prefers Python over Java, then recall their language preferences.")
 ```
 
-## What's exported
+The helper applies the escaping the server accepts (`'` → `\'`, `\` → `\\`;
+SQL-style `''` doubling is rejected with HTTP 400), refuses control
+characters, restricts field names, and casts each value to the type GoodMem
+stored — a boolean compared as `TEXT` is accepted with HTTP 200 and matches
+nothing.
 
-| Export | Purpose |
-|---|---|
-| `GoodMemRM` | `dspy.Retrieve` subclass. Returns `dotdict({"long_text": ...})` passages. |
-| `GoodMemClient` | HTTP wrapper around the GoodMem REST API. |
-| `make_goodmem_tools` | Factory that produces typed callables for `dspy.Tool` and `dspy.ReAct`. |
+## Uploads
 
-## Examples
+Uploads are **off** unless the client is given an `upload_dir`. When set,
+every path is resolved (symlinks included) and refused if it lands outside
+that directory, so a model-supplied path cannot read arbitrary host files.
 
-Two end-to-end scripts live in `examples/`:
+```python
+client = GoodMemClient(upload_dir="/srv/agent-uploads")
+```
 
-- [`rag_pipeline_example.py`](examples/rag_pipeline_example.py) runs `GoodMemRM` through `ChainOfThought` and scores the pipeline with `SemanticF1`.
-- [`react_agent_example.py`](examples/react_agent_example.py) exercises the ReAct tools across four scenarios: multi-turn conversation, cross-agent persistence, metadata-tagged filtering, and trajectory inspection.
+## Changes in 0.2.0
 
-Both scripts load a `.env` file at the repo root if `python-dotenv` is installed (`pip install dspy-goodmem[examples]`). Otherwise they read environment variables directly.
+Reproduced against the published 0.1.1 wheel, live against GoodMem v1.0.320.
+
+| Was | Now |
+| --- | --- |
+| Hand-written `requests` client | Official `goodmem` SDK |
+| A space with a failing embedder returned `success: true, totalResults: 0` — the server's `EMBEDDER_FAILED` was dropped, so a failed search looked like an empty index | `partial` + `statuses`, a `UserWarning` and a WARNING log carrying the server's reason |
+| The retriever handed DSPy `dotdict({"long_text": ...})` and nothing else — no score, no ids, no metadata | Every passage carries score, `score_kind`, ids and metadata |
+| `public_read` was a model-facing tool argument; the server answers `400 Unrecognized field "publicRead"` | Not offered anywhere |
+| Eleven agent tools including `delete_space` | `goodmem_search` + `goodmem_remember`; the rest opt-in |
+| `file_path` was an unrestricted tool argument; it read `/etc/hostname` and uploaded it | Confined to `upload_dir`; `..` and symlink escapes refused |
+| Empty search took **10.88 s** — `wait_for_indexing` on by default | **0.33 s**; the read path never polls |
+| **0 of 13** HTTP calls carried a timeout | On the client, configurable |
+| Chunks and memories were two arrays joined by position | Joined by UUID, de-duplicated by chunk id |
+| Raw negative scores | `score` / `raw_score` / `score_kind` |
+| Reusing a space name silently accepted a different embedder and reported the one you asked for | Reuse requires a match; a mismatch names both |
+| `list_spaces` returned the first page; `nextToken` appeared nowhere | Paginated, bounded by `max_list_items` |
+| No metadata filtering | `filters`, escaped and type-correct |
+| Content type guessed from the **host's** `/etc/mime.types`, so the same file could upload as a different type on another machine — and the package's own test for it failed on this one | The SDK decides; content is decoded by the type the server reports |
+| 62 tests patching `requests`, green against every defect; no CI | 55 offline + 19 live; CI on 3.10–3.13 |
+
+## Tests
+
+| Suite | Count | Needs |
+| --- | --- | --- |
+| `tests/test_dspy_goodmem.py` | 55 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
+| `tests/test_dspy_goodmem_live.py` | 19 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
-export OPENAI_API_KEY="sk-..."
-export GOODMEM_API_KEY="gm_..."
-export GOODMEM_BASE_URL="https://localhost:8080"
+pip install -e . pytest httpx "ruff==0.7.4" mypy
 
-python examples/rag_pipeline_example.py
-python examples/react_agent_example.py
+pytest tests/test_dspy_goodmem.py
+
+GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
+  GOODMEM_TEST_EMBEDDER_ID=... \
+  pytest tests/test_dspy_goodmem_live.py
+
+# what CI runs
+ruff check src tests && ruff format --check src tests && mypy src/dspy_goodmem
 ```
 
-## Why GoodMem
+The live suite creates one space per run and asserts, against a fresh server
+listing, that it is gone afterwards.
 
-GoodMem does the heavy lifting server side, so you don't ship an embedding pipeline with your DSPy app:
+## A note on TLS
 
-- Supports OpenAI, Voyage, Cohere, vLLM, TEI, and Llama.cpp as embedders, including fully local models.
-- Hybrid search combining dense and sparse embedders, with configurable weights per space.
-- Per-space chunking config: size, overlap, separators.
-- Native ingestion for plain text, PDFs, Word documents, images, spreadsheets, and other formats.
-- Metadata filters with JSONPath extraction, regex, and date ranges.
-- Reranking and auto-summary pipelines configurable per request.
-- Deep Research mode runs multiple iterative search rounds with query refinement for complex and open-ended topics.
-
-Everything runs on your own infrastructure, so documents and queries never leave your network.
-
-## Development
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
-```
-
-63 mocked unit tests cover the client, retriever, and tool factory. No live server required.
-
-## Links
-
-- [DSPy](https://dspy.ai)
-- [GoodMem](https://goodmem.ai) ([docs](https://docs.goodmem.ai))
-- [Issues](https://github.com/PAIR-Systems-Inc/dspy-goodmem/issues)
+`verify_ssl` exists for self-signed development servers and defaults to on.
+0.1.1's README and the retriever's own docstring both showed it turned off, so
+that is what people copied; no example here does, and CI fails if one appears.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT.

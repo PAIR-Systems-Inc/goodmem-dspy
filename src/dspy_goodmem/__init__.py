@@ -1,17 +1,35 @@
-"""GoodMem integration for DSPy.
+"""GoodMem integration for DSPy: a retriever and agent tools."""
 
-Provides a retriever, HTTP client, and tool factory for using GoodMem
-(https://goodmem.ai), a self-hosted RAG system, in DSPy pipelines and agents.
-
-Main exports:
-    GoodMemRM: DSPy retriever backed by GoodMem semantic search
-    GoodMemClient: HTTP client wrapping the GoodMem REST API
-    make_goodmem_tools: Factory producing callables for dspy.ReAct agents
-"""
-
-from dspy_goodmem.client import GoodMemClient
+from dspy_goodmem import filters
+from dspy_goodmem._filters import GoodMemFilterError
+from dspy_goodmem._results import (
+    INFORMATIONAL_CODES,
+    MALFORMED_STREAM_CODE,
+    UNKNOWN_CODE,
+    RetrievalHit,
+    RetrievalOutcome,
+    RetrievalStatus,
+)
+from dspy_goodmem._uploads import GoodMemUploadError
+from dspy_goodmem.client import GoodMemClient, GoodMemError
 from dspy_goodmem.retriever import GoodMemRM
 from dspy_goodmem.tools import make_goodmem_tools
 
-__version__ = "0.1.1"
-__all__ = ["GoodMemClient", "GoodMemRM", "make_goodmem_tools"]
+__version__ = "0.2.0"
+
+__all__ = [
+    "GoodMemRM",
+    "GoodMemClient",
+    "GoodMemError",
+    "GoodMemFilterError",
+    "GoodMemUploadError",
+    "RetrievalHit",
+    "RetrievalOutcome",
+    "RetrievalStatus",
+    "INFORMATIONAL_CODES",
+    "MALFORMED_STREAM_CODE",
+    "UNKNOWN_CODE",
+    "make_goodmem_tools",
+    "filters",
+    "__version__",
+]

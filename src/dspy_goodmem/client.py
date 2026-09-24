@@ -1,694 +1,486 @@
-"""GoodMem API client for DSPy.
+"""GoodMem client for DSPy, built on the official ``goodmem`` SDK.
 
-Provides a Python HTTP wrapper around all 11 GoodMem API operations using the
-``requests`` library.  Handles X-API-Key authentication, trailing-slash removal,
-NDJSON response parsing, polling with a configurable timeout, PDF base64
-encoding, idempotent space creation, and response-format variability.
+0.1.1 wrapped ``requests`` by hand. This module keeps the same shape -- one
+object holding the connection -- but delegates transport, pagination, stream
+decoding and error typing to the SDK, and adds the retrieval status contract
+on top.
 """
 
 from __future__ import annotations
 
 import base64
-import json
-import mimetypes
+import logging
 import os
-import time
-from typing import Any, ClassVar
+import warnings
+from pathlib import Path
+from typing import Any
 
-import requests
+from dspy_goodmem._filters import from_mapping
+from dspy_goodmem._results import (
+    RetrievalOutcome,
+    log_if_degraded,
+    outcome_from_events,
+)
+from dspy_goodmem._uploads import GoodMemUploadError, resolve_upload_path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_LIST_ITEMS = 200
+DEFAULT_TIMEOUT = 30.0
 
 
-class GoodMemClient:
-    """Low-level HTTP client for the GoodMem REST API.
+class GoodMemError(RuntimeError):
+    """Raised when a GoodMem operation fails.
 
-    Args:
-        api_key: GoodMem API key (sent as ``X-API-Key`` header).
-        base_url: Base URL of the GoodMem API server
-            (e.g. ``https://api.goodmem.ai`` or ``http://localhost:8080``).
-        verify_ssl: Whether to verify TLS certificates. Defaults to ``True``.
-        poll_timeout: Maximum seconds to poll when waiting for indexing
-            results during retrieval. Defaults to ``10``.
-        poll_interval: Seconds between polling attempts. Defaults to ``5``.
+    Attributes:
+        status_code: The HTTP status the server returned, when the failure
+            came from the server.
+        body: The server's response body, verbatim.
     """
 
     def __init__(
         self,
-        api_key: str,
-        base_url: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+def _wrap(exc: Exception, what: str) -> GoodMemError:
+    """Convert an SDK error into a GoodMemError, keeping the server's body."""
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    detail = str(exc)
+    if body and body not in detail:
+        detail = f"{detail} -- {body}"
+    return GoodMemError(f"{what} failed: {detail}", status_code=status, body=body)
+
+
+def _space_embedder_ids(space: Any) -> list[str]:
+    """Return the embedder ids a space is actually indexed by."""
+    out: list[str] = []
+    for config in getattr(space, "space_embedders", None) or []:
+        value = getattr(config, "embedder_id", None)
+        if value is None and isinstance(config, dict):
+            value = config.get("embedderId") or config.get("embedder_id")
+        if value:
+            out.append(str(value))
+    return out
+
+
+def _decode_content(raw: bytes, content_type: str) -> tuple[Any, str]:
+    """Decode memory content according to its content type."""
+    primary = (content_type or "").split(";")[0].strip().lower()
+    charset = "utf-8"
+    for part in (content_type or "").split(";")[1:]:
+        if "charset=" in part:
+            charset = part.split("charset=", 1)[1].strip() or "utf-8"
+    textual = primary.startswith("text/") or primary in {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    }
+    if textual:
+        try:
+            return raw.decode(charset), "text"
+        except (UnicodeDecodeError, LookupError):
+            return base64.b64encode(raw).decode("ascii"), "base64"
+    return base64.b64encode(raw).decode("ascii"), "base64"
+
+
+class GoodMemClient:
+    """A connection to a GoodMem server.
+
+    Args:
+        api_key: The GoodMem API key. Falls back to ``GOODMEM_API_KEY``.
+        base_url: The server URL. Falls back to ``GOODMEM_BASE_URL``.
+        verify_ssl: Whether to verify TLS certificates. Leave this on; it
+            exists for self-signed development servers only.
+        timeout: Per-request timeout in seconds, applied to every call.
+        upload_dir: A directory that file uploads are confined to. When
+            ``None``, no path is ever read from disk.
+        max_list_items: Upper bound on items returned by a listing.
+        client: An already-configured ``goodmem.Goodmem`` client. When given,
+            its server, credentials and TLS settings are used as-is and it is
+            never closed here.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
         *,
         verify_ssl: bool = True,
-        poll_timeout: int = 10,
-        poll_interval: int = 5,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        upload_dir: str | Path | None = None,
+        max_list_items: int = DEFAULT_MAX_LIST_ITEMS,
+        client: Any = None,
     ) -> None:
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        from goodmem import Goodmem
+
+        self.base_url = (base_url or os.environ.get("GOODMEM_BASE_URL", "")).rstrip("/")
+        resolved_key = api_key or os.environ.get("GOODMEM_API_KEY", "")
+        # Held privately: never an attribute a repr or a config dump picks up.
+        self.__api_key = resolved_key
         self.verify_ssl = verify_ssl
-        self.poll_timeout = poll_timeout
-        self.poll_interval = poll_interval
+        self.max_list_items = max_list_items
+        self.upload_dir = Path(upload_dir).expanduser().resolve() if upload_dir is not None else None
+
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            missing = [
+                name
+                for name, value in (
+                    ("GOODMEM_API_KEY", resolved_key),
+                    ("GOODMEM_BASE_URL", self.base_url),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"Missing GoodMem credentials: {', '.join(missing)}. Set "
+                    "them in the environment or pass api_key/base_url, or "
+                    "pass an already-configured client=Goodmem(...)."
+                )
+            self._client = Goodmem(
+                base_url=self.base_url,
+                api_key=resolved_key,
+                timeout=timeout,
+                verify=verify_ssl,
+            )
+            self._owns_client = True
+
+    def __repr__(self) -> str:
+        """A representation that never carries the API key."""
+        return f"{type(self).__name__}(base_url={self.base_url!r})"
+
+    def close(self) -> None:
+        """Close the HTTP client, if this object created it."""
+        if self._owns_client:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+
+    def __enter__(self) -> GoodMemClient:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # retrieval
     # ------------------------------------------------------------------
 
-    def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
-        return {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json",
-            "Accept": accept,
-        }
-
-    def _url(self, path: str) -> str:
-        return f"{self.base_url}{path}"
-
-    def _raise_for_status(self, resp: requests.Response) -> None:
-        if not resp.ok:
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = resp.text
-            raise RuntimeError(f"GoodMem API error {resp.status_code}: {detail}")
-
-    @staticmethod
-    def _parse_ndjson(text: str) -> list[dict[str, Any]]:
-        """Parse an NDJSON (or SSE-wrapped NDJSON) response body."""
-        items: list[dict[str, Any]] = []
-        for raw_line in text.strip().split("\n"):
-            line = raw_line.strip()
-            if not line:
-                continue
-            # Strip SSE ``data:`` prefix if present.
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            # Skip SSE control lines.
-            if line.startswith("event:") or line == "":
-                continue
-            try:
-                items.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return items
-
-    # ------------------------------------------------------------------
-    # Spaces
-    # ------------------------------------------------------------------
-
-    # Default chunking configuration used when creating spaces.
-    DEFAULT_CHUNKING_CONFIG: ClassVar[dict[str, Any]] = {
-        "recursive": {
-            "chunkSize": 256,
-            "chunkOverlap": 25,
-            "separators": ["\n\n", "\n", ". ", " ", ""],
-            "keepStrategy": "KEEP_END",
-            "separatorIsRegex": False,
-            "lengthMeasurement": "CHARACTER_COUNT",
-        }
-    }
-
-    def create_space(
+    def retrieve(
         self,
-        name: str,
-        embedder_id: str,
+        query: str,
+        space_ids: str | list[str],
         *,
-        chunking_config: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Create a new space, or return an existing one with the same name.
-
-        Implements idempotent creation: lists existing spaces first and reuses
-        a space that already has the requested *name*.
+        max_results: int = 5,
+        reranker_id: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> RetrievalOutcome:
+        """Retrieve chunks relevant to a query.
 
         Args:
-            name: Unique space name.
-            embedder_id: Embedder UUID to associate with the space.
-            chunking_config: Optional chunking configuration dict.  When
-                ``None`` a sensible default (recursive, 256 chars) is used.
+            query: The natural-language query.
+            space_ids: One space id or several.
+            max_results: How many chunks to ask the server for.
+            reranker_id: A reranker to apply, if any.
+            metadata_filter: Metadata every memory must match, applied
+                server-side and escaped by :mod:`dspy_goodmem.filters`.
 
         Returns:
-            A dict with ``spaceId``, ``name``, ``embedderId``, ``reused``
-            flag, and a status ``message``.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
+            The hits and any statuses the server reported.
         """
+        ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        if not ids:
+            raise GoodMemError("At least one space id is required.")
+        expression = from_mapping(metadata_filter or {})
+        keys: list[dict[str, Any]] = []
+        for space_id in ids:
+            key: dict[str, Any] = {"spaceId": space_id}
+            if expression:
+                key["filter"] = expression
+            keys.append(key)
+
+        kwargs: dict[str, Any] = {
+            "message": query,
+            "space_keys": keys,
+            "requested_size": max_results,
+            "fetch_memory": True,
+        }
+        if reranker_id:
+            kwargs["reranker_id"] = reranker_id
         try:
-            spaces = self.list_spaces()
-            for s in spaces:
-                if s.get("name") == name:
-                    return {
-                        "success": True,
-                        "spaceId": s["spaceId"],
-                        "name": s["name"],
-                        "embedderId": embedder_id,
-                        "message": "Space already exists, reusing existing space",
-                        "reused": True,
-                    }
-        except Exception:
-            pass  # If listing fails, proceed to create.
-
-        body: dict[str, Any] = {
-            "name": name,
-            "spaceEmbedders": [{"embedderId": embedder_id}],
-            "defaultChunkingConfig": chunking_config or self.DEFAULT_CHUNKING_CONFIG,
-        }
-        resp = requests.post(
-            self._url("/v1/spaces"),
-            headers=self._headers(),
-            json=body,
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        data = resp.json()
-        return {
-            "success": True,
-            "spaceId": data["spaceId"],
-            "name": data["name"],
-            "embedderId": embedder_id,
-            "message": "Space created successfully",
-            "reused": False,
-        }
-
-    def list_spaces(self) -> list[dict[str, Any]]:
-        """Return a list of all spaces.
-
-        Returns:
-            A list of space dicts, each containing ``spaceId``, ``name``,
-            and configuration details.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        resp = requests.get(
-            self._url("/v1/spaces"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        body = resp.json()
-        return body if isinstance(body, list) else body.get("spaces", [])
-
-    def get_space(self, space_id: str) -> dict[str, Any]:
-        """Fetch a single space by ID.
-
-        Args:
-            space_id: The UUID of the space to fetch.
-
-        Returns:
-            The full space object as a dict.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        resp = requests.get(
-            self._url(f"/v1/spaces/{space_id}"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        return resp.json()
-
-    def update_space(
-        self,
-        space_id: str,
-        *,
-        name: str | None = None,
-        public_read: bool | None = None,
-        replace_labels: dict[str, str] | None = None,
-        merge_labels: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Update a space's name, labels, or public access settings.
-
-        Args:
-            space_id: The UUID of the space to update.
-            name: New name for the space, or ``None`` to keep the current name.
-            public_read: Whether to allow unauthenticated read access.
-            replace_labels: Labels dict that replaces all existing labels.
-            merge_labels: Labels dict that merges into existing labels.
-
-        Returns:
-            The updated space object as a dict.
-
-        Raises:
-            ValueError: If both *replace_labels* and *merge_labels* are
-                provided (they are mutually exclusive).
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        if replace_labels and merge_labels:
-            raise ValueError("Cannot use both replace_labels and merge_labels at the same time.")
-        body: dict[str, Any] = {}
-        if name is not None:
-            body["name"] = name
-        if public_read is not None:
-            body["publicRead"] = public_read
-        if replace_labels:
-            body["replaceLabels"] = replace_labels
-        if merge_labels:
-            body["mergeLabels"] = merge_labels
-
-        resp = requests.put(
-            self._url(f"/v1/spaces/{space_id}"),
-            headers=self._headers(),
-            json=body,
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        return resp.json()
-
-    def delete_space(self, space_id: str) -> dict[str, Any]:
-        """Delete a space and all associated data.
-
-        Args:
-            space_id: The UUID of the space to delete.
-
-        Returns:
-            A confirmation dict with ``success``, ``spaceId``, and ``message``.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        resp = requests.delete(
-            self._url(f"/v1/spaces/{space_id}"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        return {"success": True, "spaceId": space_id, "message": "Space deleted successfully"}
+            stream = self._client.memories.retrieve(**kwargs)
+            with stream as events:
+                outcome = outcome_from_events(events, reranked=bool(reranker_id))
+        except GoodMemError:
+            raise
+        except Exception as exc:
+            raise _wrap(exc, "Retrieval") from exc
+        log_if_degraded(outcome, "goodmem retrieve")
+        return outcome
 
     # ------------------------------------------------------------------
-    # Memories
+    # memories
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _get_mime_type(extension: str) -> str | None:
-        """Map a file extension to a MIME type (matching the reference)."""
-        mime_map: dict[str, str] = {
-            "pdf": "application/pdf",
-            "png": "image/png",
-            "jpg": "image/jpeg",
-            "jpeg": "image/jpeg",
-            "gif": "image/gif",
-            "webp": "image/webp",
-            "txt": "text/plain",
-            "html": "text/html",
-            "md": "text/markdown",
-            "csv": "text/csv",
-            "json": "application/json",
-            "xml": "application/xml",
-            "doc": "application/msword",
-            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "xls": "application/vnd.ms-excel",
-            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "ppt": "application/vnd.ms-powerpoint",
-            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        }
-        ext = extension.lower().lstrip(".")
-        return mime_map.get(ext) or mimetypes.guess_type(f"file.{ext}")[0]
 
     def create_memory(
         self,
         space_id: str,
         *,
         text_content: str | None = None,
+        file_name: str | None = None,
         file_path: str | None = None,
         source: str | None = None,
         author: str | None = None,
-        tags: str | None = None,
+        tags: str | list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a new memory from text or a file.
+        """Store a memory from text, or from a file inside ``upload_dir``.
 
-        If *file_path* is provided it takes priority over *text_content*.
-        Binary files (PDF, images, ...) are base64-encoded; text-type files
-        are read as UTF-8.
+        ``source``, ``author`` and ``tags`` are folded into the memory's
+        metadata, as 0.1.1 did. ``file_path`` is accepted as an alias of
+        ``file_name`` for 0.1.1 callers, but it is confined to ``upload_dir``
+        exactly the same way -- the unrestricted read is gone.
 
         Args:
-            space_id: The UUID of the space to store the memory in.
-            text_content: Plain text content (sent as ``text/plain``).
-            file_path: Path to a file to upload. MIME type is auto-detected
-                from the extension.
-            source: Value for ``metadata.source``.
-            author: Value for ``metadata.author``.
-            tags: Comma-separated tags stored as ``metadata.tags`` array.
-            metadata: Additional key-value metadata merged with the above.
+            space_id: The space to write to.
+            text_content: Text to store.
+            file_name: A file inside the configured upload directory.
+            file_path: Alias of ``file_name``; same confinement.
+            source: Stored as ``metadata.source``.
+            author: Stored as ``metadata.author``.
+            tags: One tag, a comma-separated string, or a list; stored as
+                ``metadata.tags``.
+            metadata: Further key-value labels to attach.
 
         Returns:
-            A dict with ``memoryId``, ``spaceId``, processing ``status``,
-            ``contentType``, and a ``message``.
-
-        Raises:
-            ValueError: If neither *text_content* nor *file_path* is provided.
-            RuntimeError: If the GoodMem API returns an error response.
+            ``success``, ``memoryId``, ``spaceId`` and ``status``.
         """
-        body: dict[str, Any] = {"spaceId": space_id}
-
-        if file_path:
-            ext = os.path.splitext(file_path)[1].lstrip(".")
-            mime = self._get_mime_type(ext) or "application/octet-stream"
-
-            if mime.startswith("text/"):
-                with open(file_path, encoding="utf-8") as fh:
-                    body["contentType"] = mime
-                    body["originalContent"] = fh.read()
-            else:
-                with open(file_path, "rb") as fh:
-                    body["contentType"] = mime
-                    body["originalContentB64"] = base64.b64encode(fh.read()).decode("ascii")
-        elif text_content:
-            body["contentType"] = "text/plain"
-            body["originalContent"] = text_content
-        else:
-            raise ValueError("No content provided. Supply text_content or file_path.")
-
-        # Merge metadata fields.
-        merged: dict[str, Any] = {}
-        if metadata:
-            merged.update(metadata)
+        file_name = file_name or file_path
+        if not text_content and not file_name:
+            raise GoodMemError("Provide text_content or file_name.")
+        meta: dict[str, Any] = dict(metadata or {})
         if source:
-            merged["source"] = source
+            meta["source"] = source
         if author:
-            merged["author"] = author
+            meta["author"] = author
         if tags:
-            merged["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-        if merged:
-            body["metadata"] = merged
-
-        resp = requests.post(
-            self._url("/v1/memories"),
-            headers=self._headers(),
-            json=body,
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        data = resp.json()
+            meta["tags"] = [t.strip() for t in tags.split(",") if t.strip()] if isinstance(tags, str) else list(tags)
+        kwargs: dict[str, Any] = {"space_id": space_id, "metadata": meta or None}
+        if file_name:
+            kwargs["file_path"] = str(resolve_upload_path(file_name, self.upload_dir))
+        else:
+            kwargs["original_content"] = text_content
+            kwargs["content_type"] = "text/plain"
+        try:
+            memory = self._client.memories.create(**kwargs)
+        except GoodMemUploadError:
+            raise
+        except Exception as exc:
+            raise _wrap(exc, "Creating a memory") from exc
         return {
             "success": True,
-            "memoryId": data.get("memoryId"),
-            "spaceId": data.get("spaceId"),
-            "status": data.get("processingStatus", "PENDING"),
-            "contentType": body["contentType"],
-            "message": "Memory created successfully",
+            "memoryId": str(getattr(memory, "memory_id", "") or ""),
+            "spaceId": str(getattr(memory, "space_id", "") or space_id),
+            "status": str(getattr(memory, "processing_status", "") or ""),
         }
 
-    def retrieve_memories(
-        self,
-        query: str,
-        space_ids: str | list[str],
-        *,
-        max_results: int = 5,
-        include_memory_definition: bool = True,
-        wait_for_indexing: bool = True,
-    ) -> dict[str, Any]:
-        """Semantic retrieval across one or more spaces.
+    def get_memory(self, memory_id: str, *, include_content: bool = False) -> dict[str, Any]:
+        """Fetch one memory, optionally with its original content.
 
-        Parses the NDJSON streaming response.  When *wait_for_indexing* is
-        ``True`` the call polls up to ``self.poll_timeout`` seconds (default 10)
-        if zero results are returned (memories may still be processing).
-
-        Args:
-            query: Natural-language query for semantic search.
-            space_ids: A single space UUID, a comma-separated string, or a
-                list of space UUIDs to search across.
-            max_results: Maximum number of matching chunks to return.
-            include_memory_definition: Fetch full memory metadata alongside
-                each matched chunk.
-            wait_for_indexing: Retry when no results are found, up to
-                ``self.poll_timeout`` seconds.
-
-        Returns:
-            A dict with ``results`` (list of chunk dicts), ``memories``
-            (list of memory definition dicts), ``totalResults``, ``query``,
-            and ``resultSetId``.
-
-        Raises:
-            ValueError: If *space_ids* is empty after parsing.
-            RuntimeError: If the GoodMem API returns an error response.
+        Content is decoded by the memory's own content type: text as text,
+        anything else as base64, so the result is always JSON-serialisable.
+        A content fetch that fails is an error, not a successful result with
+        a note in it.
         """
-        if isinstance(space_ids, str):
-            space_ids = [sid.strip() for sid in space_ids.split(",") if sid.strip()]
-        else:
-            space_ids = [sid for sid in space_ids if sid and sid.strip()]
-
-        if not space_ids:
-            raise ValueError("At least one space ID is required.")
-
-        space_keys = [{"spaceId": sid} for sid in space_ids]
-        request_body: dict[str, Any] = {
-            "message": query,
-            "spaceKeys": space_keys,
-            "requestedSize": max_results,
-            "fetchMemory": include_memory_definition,
-        }
-
-        start = time.time()
-
-        while True:
-            resp = requests.post(
-                self._url("/v1/memories:retrieve"),
-                headers=self._headers(accept="application/x-ndjson"),
-                json=request_body,
-                verify=self.verify_ssl,
-            )
-            self._raise_for_status(resp)
-
-            items = self._parse_ndjson(resp.text)
-
-            results: list[dict[str, Any]] = []
-            memories: list[dict[str, Any]] = []
-            result_set_id = ""
-
-            for item in items:
-                if "resultSetBoundary" in item:
-                    result_set_id = item["resultSetBoundary"].get("resultSetId", "")
-                elif "memoryDefinition" in item:
-                    memories.append(item["memoryDefinition"])
-                elif "retrievedItem" in item:
-                    ri = item["retrievedItem"]
-                    chunk_data = ri.get("chunk", {})
-                    inner_chunk = chunk_data.get("chunk", {})
-                    results.append(
-                        {
-                            "chunkId": inner_chunk.get("chunkId"),
-                            "chunkText": inner_chunk.get("chunkText"),
-                            "memoryId": inner_chunk.get("memoryId"),
-                            "relevanceScore": chunk_data.get("relevanceScore"),
-                            "memoryIndex": chunk_data.get("memoryIndex"),
-                        }
-                    )
-
-            if results or not wait_for_indexing:
-                return {
-                    "success": True,
-                    "resultSetId": result_set_id,
-                    "results": results,
-                    "memories": memories,
-                    "totalResults": len(results),
-                    "query": query,
-                }
-
-            elapsed = time.time() - start
-            if elapsed >= self.poll_timeout:
-                return {
-                    "success": True,
-                    "resultSetId": result_set_id,
-                    "results": results,
-                    "memories": memories,
-                    "totalResults": 0,
-                    "query": query,
-                    "message": (
-                        f"No results found after waiting {self.poll_timeout} seconds "
-                        "for indexing. Memories may still be processing."
-                    ),
-                }
-
-            time.sleep(self.poll_interval)
-
-    def get_memory(self, memory_id: str, *, include_content: bool = True) -> dict[str, Any]:
-        """Fetch a memory's metadata and optionally its content.
-
-        Args:
-            memory_id: The UUID of the memory.
-            include_content: Also fetch the original document content via a
-                second API call.
-
-        Returns:
-            A dict with ``memory`` (metadata) and optionally ``content``
-            or ``contentError`` if the content fetch failed.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response for
-                the metadata request.
-        """
-        resp = requests.get(
-            self._url(f"/v1/memories/{memory_id}"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        result: dict[str, Any] = {"success": True, "memory": resp.json()}
-
+        try:
+            memory = self._client.memories.get(id=memory_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Fetching memory {memory_id}") from exc
+        dump = getattr(memory, "model_dump", None)
+        payload = dump(by_alias=True, exclude_none=True) if dump else {}
+        result: dict[str, Any] = {"success": True, "memory": payload}
         if include_content:
             try:
-                content_resp = requests.get(
-                    self._url(f"/v1/memories/{memory_id}/content"),
-                    headers=self._headers(),
-                    verify=self.verify_ssl,
-                )
-                self._raise_for_status(content_resp)
-                # The content endpoint may return JSON or raw text
-                # depending on the memory's content type.  Try JSON
-                # first and fall back to plain text on parse error.
-                try:
-                    result["content"] = content_resp.json()
-                except (ValueError, json.JSONDecodeError):
-                    result["content"] = content_resp.text
+                raw = self._client.memories.content(id=memory_id)
             except Exception as exc:
-                result["contentError"] = f"Failed to fetch content: {exc}"
-
+                raise _wrap(exc, f"Fetching content of memory {memory_id}") from exc
+            content_type = str(payload.get("contentType") or payload.get("content_type") or "")
+            result["content"], result["contentEncoding"] = _decode_content(raw, content_type)
         return result
 
-    def list_memories(
+    def list_memories(self, space_id: str) -> list[dict[str, Any]]:
+        """List memories in a space, following pagination."""
+        try:
+            page = self._client.memories.list(space_id=space_id, max_items=self.max_list_items)
+            memories = list(page)
+        except Exception as exc:
+            raise _wrap(exc, "Listing memories") from exc
+        return [
+            {
+                "memoryId": str(getattr(m, "memory_id", "") or ""),
+                "spaceId": str(getattr(m, "space_id", "") or ""),
+                "contentType": str(getattr(m, "content_type", "") or ""),
+                "processingStatus": str(getattr(m, "processing_status", "") or ""),
+                "metadata": dict(getattr(m, "metadata", None) or {}),
+            }
+            for m in memories
+        ]
+
+    def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        """Permanently delete a memory and everything derived from it."""
+        try:
+            self._client.memories.delete(id=memory_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Deleting memory {memory_id}") from exc
+        return {"success": True, "memoryId": memory_id}
+
+    # ------------------------------------------------------------------
+    # spaces
+    # ------------------------------------------------------------------
+
+    def list_spaces(self) -> list[dict[str, Any]]:
+        """List spaces, following pagination up to ``max_list_items``."""
+        try:
+            spaces = list(self._client.spaces.list(max_items=self.max_list_items))
+        except Exception as exc:
+            raise _wrap(exc, "Listing spaces") from exc
+        return [
+            {
+                "spaceId": str(getattr(s, "space_id", "") or ""),
+                "name": str(getattr(s, "name", "") or ""),
+                "embedderIds": _space_embedder_ids(s),
+            }
+            for s in spaces
+        ]
+
+    def list_embedders(self) -> list[dict[str, Any]]:
+        """List the embedder models available on the server."""
+        try:
+            embedders = list(self._client.embedders.list())
+        except Exception as exc:
+            raise _wrap(exc, "Listing embedders") from exc
+        return [
+            {
+                "embedderId": str(getattr(e, "embedder_id", "") or ""),
+                "displayName": str(getattr(e, "display_name", "") or ""),
+                "modelIdentifier": str(getattr(e, "model_identifier", "") or ""),
+            }
+            for e in embedders
+        ]
+
+    def create_space(self, name: str, embedder_id: str) -> dict[str, Any]:
+        """Create a space, or reuse one whose embedder already matches.
+
+        A space cannot change embedder after creation, so reusing by name
+        alone silently writes vectors from a different model than the caller
+        asked for. Reuse requires a match; a mismatch names both.
+        """
+        try:
+            existing = [
+                s
+                for s in self._client.spaces.list(max_items=self.max_list_items)
+                if str(getattr(s, "name", "") or "") == name
+            ]
+        except Exception as exc:
+            raise _wrap(exc, "Listing spaces") from exc
+        if len(existing) > 1:
+            raise GoodMemError(
+                f"{len(existing)} spaces are named {name!r}; refusing to guess "
+                "which one was meant. Pass a space id instead."
+            )
+        if existing:
+            space = existing[0]
+            actual = _space_embedder_ids(space)
+            if embedder_id not in actual:
+                raise GoodMemError(
+                    f"Space {name!r} already exists and is indexed by "
+                    f"embedder(s) {actual}, not {embedder_id!r}. An embedder "
+                    "cannot be changed after creation."
+                )
+            return {
+                "success": True,
+                "spaceId": str(getattr(space, "space_id", "") or ""),
+                "name": name,
+                "embedderId": embedder_id,
+                "reused": True,
+            }
+        try:
+            space = self._client.spaces.create(
+                name=name,
+                space_embedders=[{"embedderId": embedder_id, "defaultRetrievalWeight": 1.0}],
+            )
+        except Exception as exc:
+            raise _wrap(exc, f"Creating space {name!r}") from exc
+        return {
+            "success": True,
+            "spaceId": str(getattr(space, "space_id", "") or ""),
+            "name": str(getattr(space, "name", "") or name),
+            "embedderId": embedder_id,
+            "reused": False,
+        }
+
+    def update_space(
         self,
         space_id: str,
         *,
-        status_filter: str | None = None,
-        include_content: bool = False,
-        sort_by: str | None = None,
-        sort_order: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """List all memories in a space with optional filtering and sorting.
+        name: str | None = None,
+        labels: dict[str, str] | None = None,
+        replace_labels: bool = False,
+    ) -> dict[str, Any]:
+        """Rename a space or edit its labels.
 
-        Args:
-            space_id: The UUID of the space to list memories from.
-            status_filter: Filter by processing status (``PENDING``,
-                ``PROCESSING``, ``COMPLETED``, or ``FAILED``).
-            include_content: Include original document content in each memory.
-            sort_by: Field to sort by (``created_at`` or ``updated_at``).
-            sort_order: ``ASCENDING`` or ``DESCENDING``.
-
-        Returns:
-            A list of memory dicts.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
+        ``publicRead`` is deliberately not offered: the server removed the
+        field and rejects any request carrying it with HTTP 400.
         """
-        params: dict[str, str] = {}
-        if include_content:
-            params["includeContent"] = "true"
-        if status_filter:
-            params["statusFilter"] = status_filter
-        if sort_by:
-            params["sortBy"] = sort_by
-        if sort_order:
-            params["sortOrder"] = sort_order
-
-        resp = requests.get(
-            self._url(f"/v1/spaces/{space_id}/memories"),
-            headers=self._headers(),
-            params=params,
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        body = resp.json()
-        return body if isinstance(body, list) else body.get("memories", [])
-
-    def delete_memory(self, memory_id: str) -> dict[str, Any]:
-        """Permanently delete a memory.
-
-        Args:
-            memory_id: The UUID of the memory to delete.
-
-        Returns:
-            A confirmation dict with ``success``, ``memoryId``, and ``message``.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        resp = requests.delete(
-            self._url(f"/v1/memories/{memory_id}"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
+        request: dict[str, Any] = {}
+        if name is not None:
+            request["name"] = name
+        if labels is not None:
+            request["replaceLabels" if replace_labels else "mergeLabels"] = dict(labels)
+        if not request:
+            raise GoodMemError("update_space() needs a name or labels to change.")
+        try:
+            space = self._client.spaces.update(id=space_id, request=request)
+        except Exception as exc:
+            raise _wrap(exc, f"Updating space {space_id}") from exc
         return {
             "success": True,
-            "memoryId": memory_id,
-            "message": "Memory deleted successfully",
+            "spaceId": str(getattr(space, "space_id", "") or space_id),
+            "name": str(getattr(space, "name", "") or ""),
         }
 
-    # ------------------------------------------------------------------
-    # Embedders
-    # ------------------------------------------------------------------
-
-    def create_embedder(
-        self,
-        display_name: str,
-        provider_type: str,
-        endpoint_url: str,
-        model_identifier: str,
-        dimensionality: int,
-        distribution_type: str = "DENSE",
-        *,
-        api_path: str | None = None,
-        credentials: dict[str, Any] | None = None,
-        supported_modalities: list[str] | None = None,
-        labels: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Register a new embedder configuration on the GoodMem server.
-
-        Args:
-            display_name: User-facing name for the embedder.
-            provider_type: One of OPENAI, VLLM, TEI, LLAMA_CPP, VOYAGE, COHERE, JINA.
-            endpoint_url: Base URL of the embedding service.
-            model_identifier: Model name/identifier.
-            dimensionality: Output vector dimensions.
-            distribution_type: DENSE or SPARSE.
-            api_path: Optional API sub-path (defaults vary by provider).
-            credentials: Optional authentication payload.
-            supported_modalities: e.g. ["TEXT"]. Defaults to TEXT.
-            labels: Optional key-value labels.
-
-        Returns:
-            The created embedder dict (includes ``embedderId``).
-        """
-        body: dict[str, Any] = {
-            "displayName": display_name,
-            "providerType": provider_type,
-            "endpointUrl": endpoint_url,
-            "modelIdentifier": model_identifier,
-            "dimensionality": dimensionality,
-            "distributionType": distribution_type,
+    def get_space(self, space_id: str) -> dict[str, Any]:
+        """Fetch one space by id."""
+        try:
+            space = self._client.spaces.get(id=space_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Fetching space {space_id}") from exc
+        return {
+            "success": True,
+            "spaceId": str(getattr(space, "space_id", "") or ""),
+            "name": str(getattr(space, "name", "") or ""),
+            "embedderIds": _space_embedder_ids(space),
+            "labels": dict(getattr(space, "labels", None) or {}),
         }
-        if api_path:
-            body["apiPath"] = api_path
-        if credentials:
-            body["credentials"] = credentials
-        if supported_modalities:
-            body["supportedModalities"] = supported_modalities
-        if labels:
-            body["labels"] = labels
 
-        resp = requests.post(
-            self._url("/v1/embedders"),
-            headers=self._headers(),
-            json=body,
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        return resp.json()
+    def delete_space(self, space_id: str) -> dict[str, Any]:
+        """Permanently delete a space and every memory in it."""
+        try:
+            self._client.spaces.delete(id=space_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Deleting space {space_id}") from exc
+        return {"success": True, "spaceId": space_id}
 
-    def list_embedders(self) -> list[dict[str, Any]]:
-        """Return all available embedder models.
 
-        Returns:
-            A list of embedder dicts, each containing ``embedderId`` and
-            model configuration.
-
-        Raises:
-            RuntimeError: If the GoodMem API returns an error response.
-        """
-        resp = requests.get(
-            self._url("/v1/embedders"),
-            headers=self._headers(),
-            verify=self.verify_ssl,
-        )
-        self._raise_for_status(resp)
-        body = resp.json()
-        return body if isinstance(body, list) else body.get("embedders", [])
+__all__ = ["GoodMemClient", "GoodMemError", "GoodMemUploadError", "warnings"]

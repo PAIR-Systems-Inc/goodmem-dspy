@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Local agent/editor settings, which may hold credentials
+.claude/settings.local.json
+
+# Build and env
+dist/
+build/
+*.egg-info/
+.venv/
+__pycache__/
