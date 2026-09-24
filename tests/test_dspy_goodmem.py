@@ -1,747 +1,471 @@
-"""Unit tests for GoodMemRM, GoodMemClient, and make_goodmem_tools.
+"""Offline tests for dspy-goodmem.
 
-All HTTP calls are mocked so no live GoodMem server is required.
-
-Run with:
-    python -m pytest tests/ -v
+These drive the *real* GoodMem SDK over an ``httpx`` mock transport, fed with
+NDJSON and JSON captured from a live GoodMem server (v1.0.320). 0.1.1's suite
+patched ``requests.get``/``requests.post`` instead, which is the boundary the
+defects lived behind: all 62 of its passing tests were green against every one
+of them.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
-import tempfile
-from unittest.mock import MagicMock, patch
+import re
+from pathlib import Path
 
+import httpx
 import pytest
 
-from dspy_goodmem._dotdict import dotdict
+from dspy_goodmem import (
+    GoodMemClient,
+    GoodMemError,
+    GoodMemRM,
+    filters,
+    make_goodmem_tools,
+)
+from dspy_goodmem._filters import GoodMemFilterError
+from dspy_goodmem._results import (
+    MALFORMED_STREAM_CODE,
+    UNKNOWN_CODE,
+    classify_status,
+    orient_score,
+    outcome_from_events,
+)
+from dspy_goodmem._uploads import GoodMemUploadError, resolve_upload_path
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_response(
-    *,
-    ok=True,
-    status_code=200,
-    json_data=None,
-    text=None,
-    raise_for_status_error=None,
-):
-    """Create a mock ``requests.Response``."""
-    resp = MagicMock()
-    resp.ok = ok
-    resp.status_code = status_code
-    if json_data is not None:
-        resp.json.return_value = json_data
-    if text is not None:
-        resp.text = text
-    else:
-        resp.text = json.dumps(json_data) if json_data else ""
-    if raise_for_status_error:
-        # For _raise_for_status, we just set ok=False
-        resp.ok = False
-        resp.json.return_value = {"error": "test error"}
-    return resp
+FIXTURES = Path(__file__).parent / "goodmem_fixtures"
+BASE = "https://goodmem.test"
 
 
-# Sample NDJSON responses
-NDJSON_WITH_RESULTS = "\n".join(
-    [
-        json.dumps({"resultSetBoundary": {"resultSetId": "rs-1", "boundary": "START"}}),
-        json.dumps(
-            {
-                "retrievedItem": {
-                    "chunk": {
-                        "chunk": {"chunkId": "c-1", "chunkText": "Hello world", "memoryId": "mem-1"},
-                        "relevanceScore": 0.95,
-                        "memoryIndex": 0,
-                    }
-                }
-            }
+def fixture(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
+
+
+def make_client(handler, **kwargs) -> GoodMemClient:
+    from goodmem import Goodmem
+
+    sdk = Goodmem(
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE,
+            headers={"X-API-Key": "gm_offline_test_key"},
         ),
-        json.dumps({"memoryDefinition": {"memoryId": "mem-1", "spaceId": "sp-1"}}),
-        json.dumps({"resultSetBoundary": {"resultSetId": "rs-1", "boundary": "END"}}),
-    ]
-)
+    )
+    return GoodMemClient(api_key="gm_offline_test_key", base_url=BASE, client=sdk, **kwargs)
+
+
+def retrieve_handler(payload: bytes, *, capture: dict | None = None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(":retrieve"):
+            if capture is not None:
+                capture["body"] = json.loads(request.content)
+            return httpx.Response(200, content=payload, headers={"content-type": "application/x-ndjson"})
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    return handler
+
+
+class TestFixturesAreReal:
+    def test_fixtures_are_real_server_bytes(self):
+        stream = fixture("retrieve_ok.ndjson").decode()
+        events = [json.loads(line) for line in stream.strip().split("\n") if line.strip()]
+        assert any("resultSetBoundary" in e for e in events)
+        assert any("retrievedItem" in e for e in events)
+        assert re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-", stream, re.I)
+
+    def test_no_credential_in_fixtures(self):
+        for path in FIXTURES.iterdir():
+            assert not re.search(rb"gm_[a-z0-9]{20,}", path.read_bytes())
+
+
+class TestRetrievalStatusContract:
+    def test_q4a_degraded_with_hits_returns_the_hits(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        outcome = c.retrieve("canary", ["s-1"])
+        assert len(outcome.hits) > 0, "hits were discarded"
+        assert outcome.partial is True
+        assert {"NOT_FOUND", "RERANKING_FAILED"} <= {s.code for s in outcome.statuses}
+
+    def test_q4b_degraded_without_hits_is_flagged(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_empty.ndjson")))
+        outcome = c.retrieve("nothing", ["s-1"])
+        assert outcome.hits == []
+        assert outcome.partial is True and outcome.statuses
+
+    def test_q1_informational_codes_are_noise(self):
+        assert classify_status("FEATURE_DISABLED", "x").informational is True
+        assert classify_status("LLM_CAPABILITY_INFERRED", "x").informational is True
+
+    def test_q3_unknown_code_becomes_unknown_and_is_never_dropped(self):
+        payload = json.dumps({"status": {"code": "FUTURE", "message": "new"}}).encode() + b"\n"
+        c = make_client(retrieve_handler(payload))
+        outcome = c.retrieve("q", ["s-1"])
+        assert [s.code for s in outcome.statuses] == [UNKNOWN_CODE]
+        assert outcome.partial is True
+
+    def test_a_clean_stream_is_not_partial(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        outcome = c.retrieve("canary", ["s-1"])
+        assert outcome.partial is False and outcome.statuses == []
+        assert len(outcome.hits) >= 1
+
+    def test_a_truncated_stream_keeps_what_arrived(self):
+        whole = fixture("retrieve_ok.ndjson")
+        c = make_client(retrieve_handler(whole[: int(len(whole) * 0.6)]))
+        outcome = c.retrieve("canary", ["s-1"])
+        assert outcome.partial is True
+        assert MALFORMED_STREAM_CODE in {s.code for s in outcome.statuses}
+
+
+class TestRetrieverSurface:
+    def test_passages_carry_more_than_long_text(self):
+        """0.1.1 handed DSPy dotdict({'long_text': ...}) and nothing else."""
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        rm = GoodMemRM(space_ids=["s-1"], client=c, k=3)
+        p = dict(rm("canary").passages[0])
+        assert p["long_text"]
+        for key in ("score", "raw_score", "score_kind", "chunk_id", "memory_id", "metadata"):
+            assert key in p, f"{key} is not reaching DSPy"
+
+    def test_scores_are_higher_is_better_with_the_raw_value_kept(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        p = dict(GoodMemRM(space_ids=["s-1"], client=c)("canary").passages[0])
+        assert p["raw_score"] < 0 and p["score"] > 0
+        assert p["score"] == pytest.approx(-p["raw_score"])
+        assert p["score_kind"] == "vector"
+
+    def test_a_degraded_retrieval_with_no_passages_warns(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_empty.ndjson")))
+        rm = GoodMemRM(space_ids=["s-1"], client=c)
+        with pytest.warns(UserWarning, match="not an empty index"):
+            out = rm("nothing")
+        assert out.passages == []
+
+    def test_a_genuinely_empty_result_does_not_warn(self, recwarn):
+        c = make_client(retrieve_handler(b""))
+        out = GoodMemRM(space_ids=["s-1"], client=c)("nothing")
+        assert out.passages == []
+        assert not [w for w in recwarn if "not an empty index" in str(w.message)]
+
+    def test_degraded_with_hits_returns_them_flagged(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        passages = GoodMemRM(space_ids=["s-1"], client=c)("canary").passages
+        assert passages and dict(passages[0])["goodmem_partial"] is True
 
-NDJSON_EMPTY = json.dumps({"resultSetBoundary": {"resultSetId": "rs-empty", "boundary": "START"}})
+    def test_k_is_respected(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        assert len(GoodMemRM(space_ids=["s-1"], client=c, k=1)("canary").passages) <= 1
 
-NDJSON_SSE_FORMAT = "\n".join(
-    [
-        "event: message",
-        'data: {"resultSetBoundary": {"resultSetId": "rs-sse"}}',
-        "",
-        "event: message",
-        'data: {"retrievedItem": {"chunk": {"chunk": {"chunkId": "c-sse", "chunkText": "SSE text", "memoryId": "mem-sse"}, "relevanceScore": 0.9, "memoryIndex": 0}}}',
-    ]
-)
+    def test_an_empty_space_list_is_refused(self):
+        c = make_client(retrieve_handler(b""))
+        with pytest.raises(ValueError, match="at least one space"):
+            GoodMemRM(space_ids=[], client=c)
 
-
-# ---------------------------------------------------------------------------
-# GoodMemClient tests
-# ---------------------------------------------------------------------------
-
-
-class TestGoodMemClient:
-    """Tests for :class:`GoodMemClient`."""
-
-    def _make_client(self, **kwargs):
-        from dspy_goodmem.client import GoodMemClient
-
-        defaults = {
-            "api_key": "test-key",
-            "base_url": "http://localhost:8080",
-            "verify_ssl": False,
-        }
-        defaults.update(kwargs)
-        return GoodMemClient(**defaults)
-
-    # ---- Init ----
-
-    def test_trailing_slash_removed(self):
-        c = self._make_client(base_url="http://localhost:8080/")
-        assert c.base_url == "http://localhost:8080"
-
-    def test_headers_contain_api_key(self):
-        c = self._make_client()
-        h = c._headers()
-        assert h["X-API-Key"] == "test-key"
-        assert h["Content-Type"] == "application/json"
-        assert h["Accept"] == "application/json"
-
-    def test_headers_custom_accept(self):
-        c = self._make_client()
-        h = c._headers(accept="application/x-ndjson")
-        assert h["Accept"] == "application/x-ndjson"
-
-    # ---- NDJSON parsing ----
-
-    def test_parse_ndjson_plain(self):
-        from dspy_goodmem.client import GoodMemClient
-
-        text = (
-            '{"resultSetBoundary":{"resultSetId":"rs1"}}\n'
-            '{"retrievedItem":{"chunk":{"chunk":{"chunkId":"c1","chunkText":"hello","memoryId":"m1"},"relevanceScore":0.9}}}\n'
-        )
-        items = GoodMemClient._parse_ndjson(text)
-        assert len(items) == 2
-        assert items[0]["resultSetBoundary"]["resultSetId"] == "rs1"
-        assert items[1]["retrievedItem"]["chunk"]["chunk"]["chunkText"] == "hello"
-
-    def test_parse_ndjson_sse_format(self):
-        from dspy_goodmem.client import GoodMemClient
-
-        text = (
-            "event: message\n"
-            'data: {"resultSetBoundary":{"resultSetId":"rs2"}}\n'
-            "\n"
-            'data: {"retrievedItem":{"chunk":{"chunk":{"chunkId":"c2","chunkText":"world"},"relevanceScore":0.8}}}\n'
-        )
-        items = GoodMemClient._parse_ndjson(text)
-        assert len(items) == 2
-
-    def test_parse_ndjson_ignores_bad_json(self):
-        from dspy_goodmem.client import GoodMemClient
-
-        text = '{"valid":true}\nnot-json\n{"also":true}\n'
-        items = GoodMemClient._parse_ndjson(text)
-        assert len(items) == 2
-
-    # ---- MIME type ----
-
-    def test_get_mime_type_known(self):
-        from dspy_goodmem.client import GoodMemClient
-
-        assert GoodMemClient._get_mime_type("pdf") == "application/pdf"
-        assert GoodMemClient._get_mime_type("PNG") == "image/png"
-        assert GoodMemClient._get_mime_type(".jpg") == "image/jpeg"
-        assert GoodMemClient._get_mime_type("txt") == "text/plain"
-        assert GoodMemClient._get_mime_type("md") == "text/markdown"
-        assert GoodMemClient._get_mime_type("docx") == (
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-
-    def test_get_mime_type_unknown(self):
-        from dspy_goodmem.client import GoodMemClient
-
-        assert GoodMemClient._get_mime_type("xyz") is None
-        assert GoodMemClient._get_mime_type("") is None
-
-    # ---- list_embedders ----
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_embedders_dict_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"embedders": [{"embedderId": "e1", "displayName": "Test"}]})
-        result = self._make_client().list_embedders()
-        assert result == [{"embedderId": "e1", "displayName": "Test"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_embedders_list_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data=[{"embedderId": "e2"}])
-        result = self._make_client().list_embedders()
-        assert result == [{"embedderId": "e2"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_embedders_http_error(self, mock_get):
-        mock_get.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().list_embedders()
-
-    # ---- list_spaces ----
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_spaces_array_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data=[{"spaceId": "s1", "name": "test"}])
-        result = self._make_client().list_spaces()
-        assert result == [{"spaceId": "s1", "name": "test"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_spaces_object_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"spaces": [{"spaceId": "s1"}]})
-        result = self._make_client().list_spaces()
-        assert result == [{"spaceId": "s1"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_spaces_empty(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"spaces": []})
-        result = self._make_client().list_spaces()
-        assert result == []
-
-    # ---- get_space ----
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_get_space(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"spaceId": "s1", "name": "my-space"})
-        result = self._make_client().get_space("s1")
-        assert result["spaceId"] == "s1"
-        mock_get.assert_called_once()
-        assert "/v1/spaces/s1" in mock_get.call_args[0][0]
-
-    # ---- create_space ----
-
-    @patch("dspy_goodmem.client.requests.post")
-    @patch("dspy_goodmem.client.requests.get")
-    def test_create_space_new(self, mock_get, mock_post):
-        mock_get.return_value = _make_response(json_data=[])
-        mock_post.return_value = _make_response(json_data={"spaceId": "new-id", "name": "new-space"})
-        result = self._make_client().create_space("new-space", "emb-1")
-        assert result["reused"] is False
-        assert result["spaceId"] == "new-id"
-        assert result["success"] is True
-
-    @patch("dspy_goodmem.client.requests.post")
-    @patch("dspy_goodmem.client.requests.get")
-    def test_create_space_idempotent(self, mock_get, mock_post):
-        mock_get.return_value = _make_response(json_data=[{"spaceId": "existing-id", "name": "my-space"}])
-        result = self._make_client().create_space("my-space", "emb-1")
-        assert result["reused"] is True
-        assert result["spaceId"] == "existing-id"
-        mock_post.assert_not_called()
-
-    @patch("dspy_goodmem.client.requests.post")
-    @patch("dspy_goodmem.client.requests.get")
-    def test_create_space_list_fails_still_creates(self, mock_get, mock_post):
-        """If list_spaces fails, create_space should still try to create."""
-        mock_get.return_value = _make_response(raise_for_status_error=True)
-        mock_post.return_value = _make_response(json_data={"spaceId": "new-id", "name": "test"})
-        result = self._make_client().create_space("test", "emb-1")
-        assert result["success"] is True
-        assert result["reused"] is False
-
-    @patch("dspy_goodmem.client.requests.post")
-    @patch("dspy_goodmem.client.requests.get")
-    def test_create_space_post_error_propagates(self, mock_get, mock_post):
-        mock_get.return_value = _make_response(json_data=[])
-        mock_post.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().create_space("fail", "emb-1")
-
-    # ---- update_space ----
-
-    @patch("dspy_goodmem.client.requests.put")
-    def test_update_space(self, mock_put):
-        mock_put.return_value = _make_response(json_data={"spaceId": "s1", "name": "renamed"})
-        result = self._make_client().update_space("s1", name="renamed")
-        assert result["name"] == "renamed"
-        body = mock_put.call_args[1]["json"]
-        assert body["name"] == "renamed"
-
-    def test_update_space_both_labels_raises(self):
-        with pytest.raises(ValueError, match="Cannot use both"):
-            self._make_client().update_space("s1", replace_labels={"a": "b"}, merge_labels={"c": "d"})
-
-    # ---- delete_space ----
-
-    @patch("dspy_goodmem.client.requests.delete")
-    def test_delete_space(self, mock_delete):
-        mock_delete.return_value = _make_response(json_data={})
-        result = self._make_client().delete_space("s1")
-        assert result["success"] is True
-        assert result["spaceId"] == "s1"
-
-    # ---- create_memory ----
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_text(self, mock_post):
-        mock_post.return_value = _make_response(
-            json_data={"memoryId": "mem-1", "spaceId": "sp-1", "processingStatus": "PENDING"}
-        )
-        result = self._make_client().create_memory("sp-1", text_content="Hello world")
-        assert result["success"] is True
-        assert result["memoryId"] == "mem-1"
-        assert result["contentType"] == "text/plain"
-        body = mock_post.call_args[1]["json"]
-        assert body["originalContent"] == "Hello world"
-        assert body["contentType"] == "text/plain"
-        assert "originalContentB64" not in body
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_text_file(self, mock_post):
-        with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as f:
-            f.write("file content here")
-            tmp_path = f.name
-        try:
-            mock_post.return_value = _make_response(
-                json_data={"memoryId": "mem-f", "spaceId": "sp-1", "processingStatus": "PENDING"}
-            )
-            result = self._make_client().create_memory("sp-1", file_path=tmp_path)
-            assert result["success"] is True
-            assert result["contentType"] == "text/plain"
-            body = mock_post.call_args[1]["json"]
-            assert body["originalContent"] == "file content here"
-            assert "originalContentB64" not in body
-        finally:
-            os.unlink(tmp_path)
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_binary_file(self, mock_post):
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(b"%PDF-fake-content")
-            tmp_path = f.name
-        try:
-            mock_post.return_value = _make_response(
-                json_data={"memoryId": "mem-pdf", "spaceId": "sp-1", "processingStatus": "PENDING"}
-            )
-            result = self._make_client().create_memory("sp-1", file_path=tmp_path)
-            assert result["success"] is True
-            assert result["contentType"] == "application/pdf"
-            body = mock_post.call_args[1]["json"]
-            assert "originalContentB64" in body
-            assert "originalContent" not in body
-            # Verify base64 round-trip
-            decoded = base64.b64decode(body["originalContentB64"])
-            assert decoded == b"%PDF-fake-content"
-        finally:
-            os.unlink(tmp_path)
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_file_takes_priority(self, mock_post):
-        with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as f:
-            f.write("# Markdown content")
-            tmp_path = f.name
-        try:
-            mock_post.return_value = _make_response(
-                json_data={"memoryId": "mem-md", "spaceId": "sp-1", "processingStatus": "PENDING"}
-            )
-            result = self._make_client().create_memory("sp-1", text_content="ignored text", file_path=tmp_path)
-            assert result["contentType"] == "text/markdown"
-            body = mock_post.call_args[1]["json"]
-            assert body["originalContent"] == "# Markdown content"
-        finally:
-            os.unlink(tmp_path)
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_with_metadata(self, mock_post):
-        mock_post.return_value = _make_response(
-            json_data={"memoryId": "mem-m", "spaceId": "sp-1", "processingStatus": "PENDING"}
-        )
-        self._make_client().create_memory(
-            "sp-1",
-            text_content="test",
-            source="src",
-            author="auth",
-            tags="a,b,c",
-            metadata={"extra": "value"},
-        )
-        body = mock_post.call_args[1]["json"]
-        assert body["metadata"]["source"] == "src"
-        assert body["metadata"]["author"] == "auth"
-        assert body["metadata"]["tags"] == ["a", "b", "c"]
-        assert body["metadata"]["extra"] == "value"
-
-    def test_create_memory_no_content_raises(self):
-        with pytest.raises(ValueError, match="No content provided"):
-            self._make_client().create_memory("space-id")
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_memory_http_error(self, mock_post):
-        mock_post.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().create_memory("sp-1", text_content="test")
-
-    # ---- retrieve_memories ----
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_retrieve_with_results(self, mock_post):
-        mock_post.return_value = _make_response(text=NDJSON_WITH_RESULTS)
-        result = self._make_client().retrieve_memories("What is this?", ["sp-1"], wait_for_indexing=False)
-        assert result["success"] is True
-        assert result["totalResults"] == 1
-        assert result["results"][0]["chunkId"] == "c-1"
-        assert result["results"][0]["chunkText"] == "Hello world"
-        assert result["results"][0]["relevanceScore"] == 0.95
-        assert result["resultSetId"] == "rs-1"
-        assert len(result["memories"]) == 1
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_retrieve_sse_format(self, mock_post):
-        mock_post.return_value = _make_response(text=NDJSON_SSE_FORMAT)
-        result = self._make_client().retrieve_memories("test", ["sp-1"], wait_for_indexing=False)
-        assert result["success"] is True
-        assert result["totalResults"] == 1
-        assert result["results"][0]["chunkId"] == "c-sse"
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_retrieve_ndjson_accept_header(self, mock_post):
-        mock_post.return_value = _make_response(text=NDJSON_WITH_RESULTS)
-        self._make_client().retrieve_memories("test", ["sp-1"], wait_for_indexing=False)
-        headers = mock_post.call_args[1]["headers"]
-        assert headers["Accept"] == "application/x-ndjson"
-
-    def test_retrieve_empty_space_ids_raises(self):
-        with pytest.raises(ValueError, match="At least one space ID"):
-            self._make_client().retrieve_memories("query", "")
-
-    def test_retrieve_blank_space_ids_filtered(self):
-        with pytest.raises(ValueError, match="At least one space ID"):
-            self._make_client().retrieve_memories("query", ["", " ", ""])
-
-    def test_retrieve_comma_string_space_ids(self):
-        """Comma-separated string is split into list."""
-        c = self._make_client()
-        with patch("dspy_goodmem.client.requests.post") as mock_post:
-            mock_post.return_value = _make_response(text=NDJSON_WITH_RESULTS)
-            c.retrieve_memories("q", "sp-1, sp-2", wait_for_indexing=False)
-        body = mock_post.call_args[1]["json"]
-        assert body["spaceKeys"] == [{"spaceId": "sp-1"}, {"spaceId": "sp-2"}]
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_retrieve_wait_timeout(self, mock_post):
-        mock_post.return_value = _make_response(text=NDJSON_EMPTY)
-        c = self._make_client(poll_timeout=0, poll_interval=0)
-        result = c.retrieve_memories("test", ["sp-1"], wait_for_indexing=True)
-        assert result["success"] is True
-        assert result["totalResults"] == 0
-        assert "No results found" in result.get("message", "")
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_retrieve_http_error(self, mock_post):
-        mock_post.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().retrieve_memories("test", ["sp-1"], wait_for_indexing=False)
-
-    # ---- get_memory ----
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_get_memory_with_content(self, mock_get):
-        meta_resp = _make_response(json_data={"memoryId": "m1", "processingStatus": "COMPLETED"})
-        content_resp = _make_response(json_data={"text": "Hello world"})
-        mock_get.side_effect = [meta_resp, content_resp]
-        result = self._make_client().get_memory("m1", include_content=True)
-        assert result["success"] is True
-        assert result["memory"]["memoryId"] == "m1"
-        assert result["content"] == {"text": "Hello world"}
-        assert mock_get.call_count == 2
-        urls = [c[0][0] for c in mock_get.call_args_list]
-        assert urls[0].endswith("/v1/memories/m1")
-        assert urls[1].endswith("/v1/memories/m1/content")
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_get_memory_without_content(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"memoryId": "m1", "status": "COMPLETED"})
-        result = self._make_client().get_memory("m1", include_content=False)
-        assert result["success"] is True
-        assert result["memory"]["memoryId"] == "m1"
-        assert "content" not in result
-        assert mock_get.call_count == 1
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_get_memory_content_error_sets_content_error(self, mock_get):
-        """When /content endpoint fails, contentError is set instead of raising."""
-        meta_resp = _make_response(json_data={"memoryId": "m1", "processingStatus": "PROCESSING"})
-        content_resp = _make_response(raise_for_status_error=True)
-        mock_get.side_effect = [meta_resp, content_resp]
-        result = self._make_client().get_memory("m1", include_content=True)
-        assert result["success"] is True
-        assert "content" not in result
-        assert "contentError" in result
-        assert "Failed to fetch content" in result["contentError"]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_get_memory_metadata_error_propagates(self, mock_get):
-        mock_get.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().get_memory("nonexistent")
-
-    # ---- list_memories ----
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_memories_dict_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"memories": [{"memoryId": "m1"}]})
-        result = self._make_client().list_memories("s1")
-        assert result == [{"memoryId": "m1"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_memories_list_response(self, mock_get):
-        mock_get.return_value = _make_response(json_data=[{"memoryId": "m1"}])
-        result = self._make_client().list_memories("s1")
-        assert result == [{"memoryId": "m1"}]
-
-    @patch("dspy_goodmem.client.requests.get")
-    def test_list_memories_with_params(self, mock_get):
-        mock_get.return_value = _make_response(json_data={"memories": []})
-        self._make_client().list_memories(
-            "s1", status_filter="COMPLETED", sort_by="created_at", sort_order="DESCENDING"
-        )
-        params = mock_get.call_args[1]["params"]
-        assert params["statusFilter"] == "COMPLETED"
-        assert params["sortBy"] == "created_at"
-        assert params["sortOrder"] == "DESCENDING"
-
-    # ---- delete_memory ----
-
-    @patch("dspy_goodmem.client.requests.delete")
-    def test_delete_memory(self, mock_delete):
-        mock_delete.return_value = _make_response(json_data={})
-        result = self._make_client().delete_memory("mem-1")
-        assert result["success"] is True
-        assert result["memoryId"] == "mem-1"
-        assert "message" in result
-
-    @patch("dspy_goodmem.client.requests.delete")
-    def test_delete_memory_error_propagates(self, mock_delete):
-        mock_delete.return_value = _make_response(raise_for_status_error=True)
-        with pytest.raises(RuntimeError, match="GoodMem API error"):
-            self._make_client().delete_memory("nonexistent")
-
-    # ---- create_embedder ----
-
-    @patch("dspy_goodmem.client.requests.post")
-    def test_create_embedder(self, mock_post):
-        mock_post.return_value = _make_response(json_data={"embedderId": "e-new", "displayName": "Test"})
-        result = self._make_client().create_embedder(
-            display_name="Test",
-            provider_type="OPENAI",
-            endpoint_url="https://api.openai.com/v1",
-            model_identifier="text-embedding-3-large",
-            dimensionality=1536,
-        )
-        assert result["embedderId"] == "e-new"
-        body = mock_post.call_args[1]["json"]
-        assert body["displayName"] == "Test"
-        assert body["dimensionality"] == 1536
-
-
-# ---------------------------------------------------------------------------
-# GoodMemRM tests
-# ---------------------------------------------------------------------------
-
-
-class TestGoodMemRM:
-    """Tests for :class:`GoodMemRM`."""
-
-    def test_init_requires_api_key(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        with pytest.raises(ValueError, match="API key is required"):
-            GoodMemRM(space_ids=["s1"], base_url="http://localhost:8080")
-
-    def test_init_requires_base_url(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        with pytest.raises(ValueError, match="base URL is required"):
-            GoodMemRM(space_ids=["s1"], api_key="key")
-
-    def test_init_from_env_vars(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        with patch.dict(
-            os.environ,
-            {
-                "GOODMEM_API_KEY": "env-key",
-                "GOODMEM_BASE_URL": "https://env.test",
-            },
-        ):
-            rm = GoodMemRM(space_ids=["s1"])
-            assert rm._client.api_key == "env-key"
-            assert rm._client.base_url == "https://env.test"
-
-    def test_init_accepts_comma_separated_spaces(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(
-            space_ids="s1, s2, s3",
-            api_key="key",
-            base_url="http://localhost:8080",
-        )
-        assert rm.space_ids == ["s1", "s2", "s3"]
-
-    def test_default_k_is_3(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        assert rm.k == 3
-
-    def test_inherits_from_retrieve(self):
-        import dspy
-
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        assert isinstance(rm, dspy.Retrieve)
-
-    def test_forward_returns_dotdict_list(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        mock_result = {
-            "success": True,
-            "results": [
-                {"chunkText": "passage one", "relevanceScore": 0.9},
-                {"chunkText": "passage two", "relevanceScore": 0.8},
-            ],
-            "memories": [],
-            "totalResults": 2,
-            "query": "test query",
-        }
-        with patch.object(rm._client, "retrieve_memories", return_value=mock_result):
-            passages = rm.forward("test query", k=2)
-
-        assert len(passages) == 2
-        assert all(isinstance(p, dotdict) for p in passages)
-        assert passages[0]["long_text"] == "passage one"
-        assert passages[1].long_text == "passage two"
-
-    def test_forward_multiple_queries(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        mock_result = {
-            "success": True,
-            "results": [{"chunkText": "answer", "relevanceScore": 0.95}],
-            "memories": [],
-            "totalResults": 1,
-            "query": "",
-        }
-        with patch.object(rm._client, "retrieve_memories", return_value=mock_result) as mock_ret:
-            passages = rm.forward(["q1", "q2"], k=1)
-        assert mock_ret.call_count == 2
-        assert len(passages) == 2
-
-    def test_forward_skips_empty_chunks(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        mock_result = {
-            "success": True,
-            "results": [
-                {"chunkText": "", "relevanceScore": 0.5},
-                {"chunkText": "real text", "relevanceScore": 0.9},
-            ],
-            "memories": [],
-            "totalResults": 2,
-            "query": "q",
-        }
-        with patch.object(rm._client, "retrieve_memories", return_value=mock_result):
-            passages = rm.forward("q")
-        assert len(passages) == 1
-        assert passages[0].long_text == "real text"
-
-    def test_forward_empty_results(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        mock_result = {
-            "success": True,
-            "results": [],
-            "memories": [],
-            "totalResults": 0,
-            "query": "q",
-        }
-        with patch.object(rm._client, "retrieve_memories", return_value=mock_result):
-            passages = rm.forward("q")
-        assert passages == []
-
-    def test_forward_filters_empty_queries(self):
-        from dspy_goodmem.retriever import GoodMemRM
-
-        rm = GoodMemRM(space_ids=["s1"], api_key="key", base_url="http://localhost:8080")
-        mock_result = {
-            "success": True,
-            "results": [{"chunkText": "answer", "relevanceScore": 0.9}],
-            "memories": [],
-            "totalResults": 1,
-            "query": "q",
-        }
-        with patch.object(rm._client, "retrieve_memories", return_value=mock_result) as mock_ret:
-            passages = rm.forward(["", "real query", ""])
-        assert mock_ret.call_count == 1
-        assert len(passages) == 1
-
-
-# ---------------------------------------------------------------------------
-# Tool factory tests
-# ---------------------------------------------------------------------------
-
-
-class TestMakeGoodmemTools:
-    """Tests for :func:`make_goodmem_tools`."""
-
-    def _make_tools(self):
-        from dspy_goodmem import GoodMemClient, make_goodmem_tools
-
-        client = GoodMemClient(api_key="k", base_url="http://localhost:8080", verify_ssl=False)
-        return make_goodmem_tools(client)
-
-    def test_returns_11_tools(self):
-        assert len(self._make_tools()) == 11
-
-    def test_tool_names(self):
-        names = {t.__name__ for t in self._make_tools()}
-        expected = {
-            "create_space",
-            "list_spaces",
-            "get_space",
-            "update_space",
-            "delete_space",
-            "create_memory",
-            "retrieve_memories",
-            "get_memory",
-            "list_memories",
-            "delete_memory",
-            "list_embedders",
-        }
-        assert names == expected
-
-    def test_tools_have_docstrings(self):
-        for t in self._make_tools():
-            assert t.__doc__, f"Tool {t.__name__} has no docstring"
-
-    def test_tools_have_type_hints(self):
+    def test_no_polling_knobs_remain_on_the_retriever(self):
         import inspect
 
-        for t in self._make_tools():
-            hints = inspect.signature(t)
-            assert hints.return_annotation is not inspect.Parameter.empty, f"Tool {t.__name__} missing return type hint"
+        params = set(inspect.signature(GoodMemRM.__init__).parameters)
+        for banned in ("wait_for_indexing", "poll_timeout", "poll_interval"):
+            assert banned not in params
 
-    def test_dspy_tool_wrapping(self):
-        import dspy
+    def test_min_score_warns_and_names_the_range(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        rm = GoodMemRM(space_ids=["s-1"], client=c, reranker_id="rr", min_score=99.0)
+        with pytest.warns(UserWarning, match="observed scores ranged"):
+            assert rm("canary").passages == []
 
-        for fn in self._make_tools():
-            wrapped = dspy.Tool(fn)
-            assert wrapped.name == fn.__name__
-            assert wrapped.desc
+    def test_no_threshold_is_sent_by_default(self):
+        capture: dict = {}
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson"), capture=capture))
+        GoodMemRM(space_ids=["s-1"], client=c)("canary")
+        assert "relevanceThreshold" not in json.dumps(capture["body"])
+
+
+class TestToolSurface:
+    def test_default_tools_are_a_search_and_a_write(self):
+        """0.1.1 exposed eleven tools including delete_space."""
+        c = make_client(retrieve_handler(b""))
+        assert [t.__name__ for t in make_goodmem_tools(c, ["s-1"])] == [
+            "goodmem_search",
+            "goodmem_remember",
+        ]
+
+    def test_admin_and_delete_are_opt_in(self):
+        c = make_client(retrieve_handler(b""))
+        names = [getattr(t, "__name__", "") for t in make_goodmem_tools(c, ["s-1"])]
+        for banned in ("delete_space", "delete_memory", "update_space", "create_space"):
+            assert banned not in names
+
+    def test_admin_adds_management_but_not_deletion(self):
+        c = make_client(retrieve_handler(b""))
+        names = [getattr(t, "__name__", "") for t in make_goodmem_tools(c, ["s-1"], allow_admin=True)]
+        assert "create_space" in names and "delete_space" not in names
+
+    def test_delete_is_separate(self):
+        c = make_client(retrieve_handler(b""))
+        names = [getattr(t, "__name__", "") for t in make_goodmem_tools(c, ["s-1"], allow_delete=True)]
+        assert "delete_space" in names and "delete_memory" in names
+
+    def test_the_model_never_chooses_a_space(self):
+        import inspect
+
+        c = make_client(retrieve_handler(b""))
+        search = make_goodmem_tools(c, ["s-1"])[0]
+        assert set(inspect.signature(search).parameters) == {"query", "top_k"}
+
+    def test_upload_requires_an_upload_dir(self):
+        c = make_client(retrieve_handler(b""))
+        with pytest.raises(ValueError, match="upload_dir"):
+            make_goodmem_tools(c, ["s-1"], allow_upload=True)
+
+    def test_search_tool_reports_partial(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        out = make_goodmem_tools(c, ["s-1"])[0]("canary")
+        assert out["partial"] is True and out["statuses"] and out["warning"]
+
+
+class TestPublicReadRemoved:
+    def test_update_space_has_no_public_read(self):
+        """0.1.1 sent publicRead and the server answers 400."""
+        import inspect
+
+        assert "public_read" not in inspect.signature(GoodMemClient.update_space).parameters
+
+    def test_no_public_read_in_any_shipped_code_path(self):
+        import ast
+
+        import dspy_goodmem
+
+        offenders = []
+        for path in Path(dspy_goodmem.__file__).parent.glob("*.py"):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    node.value = ""
+            if "publicRead" in ast.unparse(tree) or "public_read" in ast.unparse(tree):
+                offenders.append(path.name)
+        assert offenders == []
+
+
+class TestUploads:
+    def test_paths_outside_the_upload_dir_are_refused(self, tmp_path):
+        for bad in ("/etc/hostname", "../../etc/hostname"):
+            with pytest.raises(GoodMemUploadError, match="outside the upload"):
+                resolve_upload_path(bad, tmp_path)
+
+    def test_symlink_escape_is_refused(self, tmp_path):
+        os.symlink("/etc/hostname", tmp_path / "escape.txt")
+        with pytest.raises(GoodMemUploadError, match="outside the upload"):
+            resolve_upload_path("escape.txt", tmp_path)
+
+    def test_a_file_inside_is_allowed(self, tmp_path):
+        (tmp_path / "ok.txt").write_text("hi")
+        assert resolve_upload_path("ok.txt", tmp_path).name == "ok.txt"
+
+    def test_uploads_off_without_a_dir(self):
+        with pytest.raises(GoodMemUploadError, match="disabled"):
+            resolve_upload_path("/etc/hostname", None)
+
+    def test_create_memory_refuses_a_host_path(self, tmp_path):
+        c = make_client(retrieve_handler(b""), upload_dir=tmp_path)
+        with pytest.raises(GoodMemUploadError):
+            c.create_memory("s-1", file_name="/etc/hostname")
+
+
+class TestFilters:
+    def test_apostrophes_are_backslash_escaped(self):
+        assert filters.equals("n", "o'brien").endswith(r"'o\'brien'")
+
+    def test_control_characters_are_refused(self):
+        with pytest.raises(GoodMemFilterError, match="control characters"):
+            filters.equals("f", "a\nb")
+
+    def test_booleans_cast_as_boolean(self):
+        assert filters.equals("a", True) == "CAST(val('$.a') AS BOOLEAN) = true"
+
+    def test_unsafe_field_names_are_refused(self):
+        with pytest.raises(GoodMemFilterError, match="field name"):
+            filters.equals("a' OR '1", "x")
+
+    def test_the_filter_reaches_the_request(self):
+        capture: dict = {}
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson"), capture=capture))
+        c.retrieve("q", ["s-1"], metadata_filter={"tenant": "acme"})
+        assert capture["body"]["spaceKeys"][0]["filter"] == ("CAST(val('$.tenant') AS TEXT) = 'acme'")
+
+
+class TestSpacesAndErrors:
+    def _spaces(self, spaces):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/v1/spaces":
+                return httpx.Response(200, json={"spaces": spaces})
+            return httpx.Response(404, json={"message": "unexpected"})
+
+        return handler
+
+    def _space(self, space_id, name, embedders):
+        import copy
+
+        t = copy.deepcopy(json.loads(fixture("spaces_page1.json"))["spaces"][0])
+        t["spaceId"], t["name"] = space_id, name
+        et = t["spaceEmbedders"][0]
+        t["spaceEmbedders"] = []
+        for e in embedders:
+            clone = copy.deepcopy(et)
+            clone["embedderId"], clone["spaceId"] = e, space_id
+            t["spaceEmbedders"].append(clone)
+        return t
+
+    def test_reuse_requires_a_matching_embedder(self):
+        c = make_client(self._spaces([self._space("s-1", "notes", ["emb-a"])]))
+        with pytest.raises(GoodMemError) as err:
+            c.create_space("notes", "emb-b")
+        assert "emb-a" in str(err.value) and "emb-b" in str(err.value)
+
+    def test_reuse_with_a_matching_embedder_succeeds(self):
+        c = make_client(self._spaces([self._space("s-1", "notes", ["emb-a"])]))
+        assert c.create_space("notes", "emb-a")["reused"] is True
+
+    def test_an_ambiguous_name_is_an_error(self):
+        c = make_client(self._spaces([self._space("s-1", "notes", ["emb-a"]), self._space("s-2", "notes", ["emb-a"])]))
+        with pytest.raises(GoodMemError, match="refusing to guess"):
+            c.create_space("notes", "emb-a")
+
+    def test_listing_follows_pagination(self):
+        p1 = json.loads(fixture("spaces_page1.json"))
+        p2 = json.loads(fixture("spaces_page2.json"))
+        p2.pop("nextToken", None)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, json=p1 if len(calls) == 1 else p2)
+
+        c = make_client(handler)
+        spaces = c.list_spaces()
+        assert len(calls) == 2, "the second page was never requested"
+        assert len(spaces) == len(p1["spaces"]) + len(p2["spaces"])
+
+    def test_the_servers_message_reaches_the_caller(self):
+        body = fixture("error_400.json")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, content=body, headers={"content-type": "application/json"})
+
+        c = make_client(handler)
+        with pytest.raises(GoodMemError) as err:
+            c.list_spaces()
+        assert "Invalid embedder ID format" in str(err.value)
+        assert err.value.status_code == 400
+
+
+class TestContentAndSecrets:
+    def _handler(self, content: bytes, content_type: str, status: int = 200):
+        memory = json.loads(fixture("memory_get.json"))
+        memory["contentType"] = content_type
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/content"):
+                return httpx.Response(status, content=content, headers={"content-type": content_type})
+            return httpx.Response(200, json=memory)
+
+        return handler
+
+    def test_text_content_comes_back_as_text(self):
+        c = make_client(self._handler(b"hello", "text/plain"))
+        out = c.get_memory("m-1", include_content=True)
+        assert out["content"] == "hello" and out["contentEncoding"] == "text"
+
+    def test_binary_content_is_base64_and_serialisable(self):
+        import base64
+
+        pdf = b"%PDF-1.4\x00\xff"
+        c = make_client(self._handler(pdf, "application/pdf"))
+        out = c.get_memory("m-1", include_content=True)
+        json.dumps(out)
+        assert base64.b64decode(out["content"]) == pdf
+
+    def test_a_failed_content_fetch_raises(self):
+        c = make_client(self._handler(b'{"m":"gone"}', "application/json", 404))
+        with pytest.raises(GoodMemError):
+            c.get_memory("m-1", include_content=True)
+
+    def test_the_api_key_is_not_in_repr(self):
+        c = make_client(retrieve_handler(b""))
+        assert "gm_offline_test_key" not in repr(c)
+
+    def test_the_api_key_is_not_a_public_attribute(self):
+        c = make_client(retrieve_handler(b""))
+        public = {v for k, v in vars(c).items() if not k.startswith("_") and isinstance(v, str)}
+        assert "gm_offline_test_key" not in public
+
+    def test_an_injected_client_is_not_closed(self):
+        c = make_client(retrieve_handler(b""))
+        c.close()
+        assert c._owns_client is False
+
+
+class TestScores:
+    def test_vector_scores_flip(self):
+        assert orient_score(-0.51, reranked=False) == pytest.approx(0.51)
+
+    def test_reranker_scores_do_not_flip(self):
+        assert orient_score(0.93, reranked=True) == pytest.approx(0.93)
+        assert orient_score(-0.14, reranked=True) == pytest.approx(-0.14)
+
+
+class TestJoin:
+    def _chunk(self, chunk_id, text, memory_id, score):
+        import copy
+
+        for line in fixture("retrieve_ok.ndjson").decode().strip().split("\n"):
+            e = json.loads(line)
+            if "retrievedItem" in e:
+                e = copy.deepcopy(e)
+                ref = e["retrievedItem"]["chunk"]
+                ref["relevanceScore"] = score
+                ref["chunk"]["chunkId"] = chunk_id
+                ref["chunk"]["chunkText"] = text
+                ref["chunk"]["memoryId"] = memory_id
+                return e
+        raise AssertionError("no chunk event in the fixture")
+
+    def _definition(self, memory_id, metadata):
+        import copy
+
+        for line in fixture("retrieve_ok.ndjson").decode().strip().split("\n"):
+            e = json.loads(line)
+            if "memoryDefinition" in e:
+                e = copy.deepcopy(e)
+                e["memoryDefinition"]["memoryId"] = memory_id
+                e["memoryDefinition"]["metadata"] = metadata
+                return e
+        raise AssertionError("no definition event in the fixture")
+
+    def _as_models(self, events):
+        from goodmem.models import RetrieveMemoryEvent
+
+        return [RetrieveMemoryEvent.model_validate(e) for e in events]
+
+    def test_join_is_by_uuid_not_arrival_order(self):
+        events = [
+            self._chunk("c1", "alpha", "mem-A", -0.2),
+            self._chunk("c2", "bravo", "mem-B", -0.4),
+            self._definition("mem-B", {"tag": "B"}),
+            self._definition("mem-A", {"tag": "A"}),
+        ]
+        out = outcome_from_events(self._as_models(events))
+        by_id = {h.chunk_id: h for h in out.hits}
+        assert by_id["c1"].metadata == {"tag": "A"}
+        assert by_id["c2"].metadata == {"tag": "B"}
+
+    def test_duplicate_chunks_collapse_but_distinct_ones_do_not(self):
+        dup = outcome_from_events(
+            self._as_models([self._chunk("c1", "a", "m", -0.2), self._chunk("c1", "a", "m", -0.2)])
+        )
+        assert len(dup.hits) == 1
+        two = outcome_from_events(
+            self._as_models([self._chunk("c1", "a", "m", -0.2), self._chunk("c2", "b", "m", -0.3)])
+        )
+        assert len(two.hits) == 2

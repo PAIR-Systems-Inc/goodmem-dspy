@@ -1,0 +1,95 @@
+# Tests, lint and the gates. 0.1.1 shipped to PyPI with no CI at all: its 62
+# passing tests patched `requests` directly, so they were green against every
+# defect the 0.2.0 audit reproduced live.
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e . pytest httpx "ruff==0.7.4" mypy
+
+      - name: Lint
+        run: |
+          set -euo pipefail
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Types
+        run: mypy src/dspy_goodmem
+
+      - name: Offline suite
+        run: pytest tests/test_dspy_goodmem.py -v
+
+      - name: Live tests must skip without credentials
+        env:
+          GOODMEM_API_KEY: ""
+          GOODMEM_BASE_URL: ""
+        run: |
+          set -euo pipefail
+          pytest tests/test_dspy_goodmem_live.py -v > live.log 2>&1
+          grep -q "skipped" live.log
+          if grep -qE "^tests.*(PASSED|FAILED)" live.log; then
+            echo "A live test ran without credentials -- a key may be baked in."
+            exit 1
+          fi
+
+      - name: Package builds and imports in a clean environment
+        run: |
+          set -euo pipefail
+          pip install build
+          python -m build
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install --quiet dist/*.whl
+          /tmp/clean/bin/python -c "import dspy_goodmem; print(dspy_goodmem.__version__)"
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No GoodMem API key in any tracked file
+        run: |
+          set -euo pipefail
+          if git ls-files -z | xargs -0 grep -IEn "gm_[a-z0-9]{20,}" ; then
+            echo "A GoodMem API key is committed to this repository."
+            exit 1
+          fi
+          echo "No credential-shaped string in any tracked file."
+
+      - name: No TLS-disabled example in shipped code or docs
+        run: |
+          set -euo pipefail
+          # 0.1.1's README and the retriever docstring both taught users to
+          # pass verify_ssl=False. It stays available as an argument, but no
+          # example may hand it to a reader to copy.
+          if grep -rIn "verify_ssl=False" src README.md 2>/dev/null ; then
+            echo "A TLS-disabled example is present in shipped code or docs."
+            exit 1
+          fi
+          echo "No TLS-disabled example."
