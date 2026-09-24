@@ -273,6 +273,41 @@ class TestUploads:
             c.create_memory("s-1", file_name="/etc/hostname")
 
 
+class TestCreateMemoryConveniences:
+    """0.1.1 accepted source/author/tags and folded them into metadata; a
+    rewrite that silently dropped them broke the shipped RAG example."""
+
+    def _capture(self):
+        capture: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/memories" and request.method == "POST":
+                capture["body"] = json.loads(request.content)
+                return httpx.Response(201, json=json.loads(fixture("memory_get.json")))
+            return httpx.Response(404, json={"message": "unexpected"})
+
+        return capture, make_client(handler)
+
+    def test_source_author_and_tags_fold_into_metadata(self):
+        capture, c = self._capture()
+        c.create_memory("s-1", text_content="x", source="kb", author="me", tags="a, b")
+        meta = capture["body"]["metadata"]
+        assert meta["source"] == "kb" and meta["author"] == "me"
+        assert meta["tags"] == ["a", "b"]
+
+    def test_explicit_metadata_is_kept_alongside(self):
+        capture, c = self._capture()
+        c.create_memory("s-1", text_content="x", source="kb", metadata={"k": "v"})
+        assert capture["body"]["metadata"] == {"k": "v", "source": "kb"}
+
+    def test_file_path_alias_is_still_confined(self, tmp_path):
+        """The 0.1.1 argument name works, but it cannot read outside upload_dir."""
+        _, c = self._capture()
+        c.upload_dir = tmp_path
+        with pytest.raises(GoodMemUploadError, match="outside the upload"):
+            c.create_memory("s-1", file_path="/etc/hostname")
+
+
 class TestFilters:
     def test_apostrophes_are_backslash_escaped(self):
         assert filters.equals("n", "o'brien").endswith(r"'o\'brien'")

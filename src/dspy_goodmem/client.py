@@ -239,22 +239,44 @@ class GoodMemClient:
         *,
         text_content: str | None = None,
         file_name: str | None = None,
+        file_path: str | None = None,
+        source: str | None = None,
+        author: str | None = None,
+        tags: str | list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Store a memory from text, or from a file inside ``upload_dir``.
+
+        ``source``, ``author`` and ``tags`` are folded into the memory's
+        metadata, as 0.1.1 did. ``file_path`` is accepted as an alias of
+        ``file_name`` for 0.1.1 callers, but it is confined to ``upload_dir``
+        exactly the same way -- the unrestricted read is gone.
 
         Args:
             space_id: The space to write to.
             text_content: Text to store.
             file_name: A file inside the configured upload directory.
-            metadata: Key-value labels to attach.
+            file_path: Alias of ``file_name``; same confinement.
+            source: Stored as ``metadata.source``.
+            author: Stored as ``metadata.author``.
+            tags: One tag, a comma-separated string, or a list; stored as
+                ``metadata.tags``.
+            metadata: Further key-value labels to attach.
 
         Returns:
             ``success``, ``memoryId``, ``spaceId`` and ``status``.
         """
+        file_name = file_name or file_path
         if not text_content and not file_name:
             raise GoodMemError("Provide text_content or file_name.")
-        kwargs: dict[str, Any] = {"space_id": space_id, "metadata": metadata or None}
+        meta: dict[str, Any] = dict(metadata or {})
+        if source:
+            meta["source"] = source
+        if author:
+            meta["author"] = author
+        if tags:
+            meta["tags"] = [t.strip() for t in tags.split(",") if t.strip()] if isinstance(tags, str) else list(tags)
+        kwargs: dict[str, Any] = {"space_id": space_id, "metadata": meta or None}
         if file_name:
             kwargs["file_path"] = str(resolve_upload_path(file_name, self.upload_dir))
         else:
