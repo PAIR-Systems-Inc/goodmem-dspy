@@ -7,7 +7,8 @@ to use one, so the default surface here is a search and a write; everything
 else is opt-in and chosen by the developer.
 
 Every id an opt-in tool accepts is declared a UUID in the schema the model is
-shown, and the client refuses anything else before a request is made: the
+shown (on DSPy 3.x; DSPy 2.5 shows only the type name), and the client
+refuses anything else before a request is made, on every version: the
 SDK puts ids into URL paths, where ``../spaces/<id>`` passed as a memory id
 would otherwise delete a whole space.
 """
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from dspy_goodmem._ids import require_uuid, require_uuids
+from dspy_goodmem._ids import id_list, require_uuid, require_uuids
 from dspy_goodmem.client import GoodMemClient
 
 
@@ -52,7 +53,7 @@ def make_goodmem_tools(
         ValueError: If uploads are requested without an ``upload_dir``.
         GoodMemIdError: If a space id or the reranker id is not a UUID.
     """
-    ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+    ids = id_list(space_ids)
     if not ids:
         raise ValueError("make_goodmem_tools() needs at least one space id.")
     ids = require_uuids(ids, "space_ids")

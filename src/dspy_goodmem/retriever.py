@@ -24,7 +24,7 @@ from typing import Any
 import dspy
 
 from dspy_goodmem._dotdict import dotdict
-from dspy_goodmem._ids import require_uuid, require_uuids
+from dspy_goodmem._ids import id_list, require_uuid, require_uuids
 from dspy_goodmem.client import GoodMemClient
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ class GoodMemRM(dspy.Retrieve):
         client: GoodMemClient | None = None,
     ) -> None:
         super().__init__(k=k)
-        self.space_ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        self.space_ids = id_list(space_ids)
         if not self.space_ids:
             raise ValueError("GoodMemRM needs at least one space id.")
         self.space_ids = require_uuids(self.space_ids, "space_ids")

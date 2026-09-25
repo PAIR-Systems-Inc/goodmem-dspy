@@ -742,12 +742,12 @@ class TestIdsMustBeUuids:
 
     @pytest.mark.parametrize("name", list(MODEL_TOOLS))
     def test_a_model_tool_refuses_a_hostile_id_through_dspy(self, wire, name):
-        """As ReAct calls it: ``dspy.Tool`` checks the arguments against the schema first."""
+        """As ReAct calls it. DSPy 3.x checks the schema first; DSPy 2.5 leaves it to the client."""
         server, client = wire
         field, extra = MODEL_TOOLS[name]
         tool = dspy.Tool(model_tool(client, name))
-        # dspy.Tool refuses in its own words (a jsonschema or pydantic error,
-        # both ValueErrors), so only the type and the silence are checked.
+        # dspy.Tool on 3.x refuses in its own words (a jsonschema or pydantic
+        # error, both ValueErrors), so only the type and the silence are checked.
         assert_refused_before_any_request(server, lambda v: tool(**{field: v}, **extra), field, expected="")
 
     @pytest.mark.parametrize("name", list(MODEL_TOOLS))
@@ -850,3 +850,147 @@ class TestIdsMustBeUuids:
 
         assert issubclass(dspy_goodmem.GoodMemIdError, ValueError)
         assert "GoodMemIdError" in dspy_goodmem.__all__
+
+
+# What a caller's own object may not do to an id after it has been checked
+# ---------------------------------------------------------------------------
+
+
+class _RewritingStr(str):
+    """A ``str`` whose methods lie: every derived value is a traversal.
+
+    Only Python code can build one -- model JSON and configuration strings
+    cannot -- but on the first 0.2.1 draft the check ran on the real
+    characters and the id sent was ``value.lower()``, which this overrides.
+    """
+
+    def lower(self):  # type: ignore[override]
+        return f"../spaces/{SPACE}"
+
+    def __str__(self):
+        return f"../spaces/{SPACE}"
+
+    def __format__(self, spec):
+        return f"../spaces/{SPACE}"
+
+
+class _RewritingUUID(uuid.UUID):
+    """A ``uuid.UUID`` whose string form is a traversal."""
+
+    def __str__(self):
+        return f"../spaces/{SPACE}"
+
+
+class _PretendStr:
+    """Not a ``str`` at all, though ``isinstance(x, str)`` says it is."""
+
+    @property  # type: ignore[misc]
+    def __class__(self):
+        return str
+
+    def lower(self):
+        return f"../spaces/{SPACE}"
+
+
+#: The id each path call is given, and the one request it must produce.
+PATH_TARGETS = {
+    "GoodMemClient.get_memory": (MEMORY, [f"GET /v1/memories/{MEMORY}"]),
+    "GoodMemClient.get_memory(include_content=True)": (
+        MEMORY,
+        [f"GET /v1/memories/{MEMORY}", f"GET /v1/memories/{MEMORY}/content"],
+    ),
+    "GoodMemClient.list_memories": (SPACE_2, [f"GET /v1/spaces/{SPACE_2}/memories"]),
+    "GoodMemClient.delete_memory": (MEMORY, [f"DELETE /v1/memories/{MEMORY}"]),
+    "GoodMemClient.get_space": (SPACE_2, [f"GET /v1/spaces/{SPACE_2}"]),
+    "GoodMemClient.update_space": (SPACE_2, [f"PUT /v1/spaces/{SPACE_2}"]),
+    "GoodMemClient.delete_space": (SPACE_2, [f"DELETE /v1/spaces/{SPACE_2}"]),
+}
+
+
+def _paths(server) -> list[str]:
+    return [f"{method} {urlsplit(target).path}" for method, target, _ in server.requests]
+
+
+class TestIdObjectsCannotRewriteThemselves:
+    """The id sent is the one that was checked, whatever the caller's object does."""
+
+    @pytest.mark.parametrize("name", list(PATH_CALLS))
+    def test_a_str_subclass_reaches_only_the_id_it_holds(self, wire, name):
+        server, client = wire
+        _, call = PATH_CALLS[name]
+        valid, expected = PATH_TARGETS[name]
+        try:
+            call(client, _RewritingStr(valid.upper()))
+        except GoodMemError:
+            pass  # the recorder's fixture body may not parse; only the path matters
+        assert _paths(server) == expected
+
+    @pytest.mark.parametrize("name", list(PATH_CALLS))
+    def test_a_uuid_subclass_whose_text_is_not_a_uuid_is_refused(self, wire, name):
+        server, client = wire
+        field, call = PATH_CALLS[name]
+        valid, _ = PATH_TARGETS[name]
+        with pytest.raises(ValueError, match=f"{field} must be a UUID"):
+            call(client, _RewritingUUID(valid))
+        assert server.requests == []
+
+    @pytest.mark.parametrize("name", list(PATH_CALLS))
+    def test_an_object_pretending_to_be_a_str_is_refused(self, wire, name):
+        server, client = wire
+        field, call = PATH_CALLS[name]
+        with pytest.raises(ValueError, match=f"{field} must be a UUID"):
+            call(client, _PretendStr())
+        assert server.requests == []
+
+    def test_a_str_subclass_in_a_body_is_sent_as_the_id_it_holds(self, wire):
+        server, client = wire
+        client.retrieve("q", [_RewritingStr(SPACE)], reranker_id=_RewritingStr(RERANKER))
+        client.create_memory(_RewritingStr(SPACE), text_content="x")
+        retrieve, create = (json.loads(body) for _, _, body in server.requests)
+        assert [key["spaceId"] for key in retrieve["spaceKeys"]] == [SPACE]
+        assert retrieve["postProcessor"]["config"]["reranker_id"] == RERANKER
+        assert create["spaceId"] == SPACE
+
+    def test_the_validator_returns_a_plain_lowercase_str(self):
+        from dspy_goodmem._ids import require_uuid
+
+        checked = require_uuid(_RewritingStr(SPACE.upper()), "space_id")
+        assert type(checked) is str
+        assert checked == SPACE
+
+
+# Configured ids are refused when the retriever or tools are built
+# ---------------------------------------------------------------------------
+
+#: Construction only -- nothing is called afterwards, so the check each
+#: client call makes cannot stand in for the one made at startup.
+BUILD_CALLS = {
+    "GoodMemRM(space_ids=[id])": ("space_ids[0]", lambda c, v: GoodMemRM(space_ids=[v], client=c)),
+    "GoodMemRM(space_ids=id)": ("space_ids[0]", lambda c, v: GoodMemRM(space_ids=v, client=c)),
+    "GoodMemRM(reranker_id)": ("reranker_id", lambda c, v: GoodMemRM(space_ids=[SPACE], client=c, reranker_id=v)),
+    "make_goodmem_tools(space_ids=[id])": ("space_ids[0]", lambda c, v: make_goodmem_tools(c, [v])),
+    "make_goodmem_tools(space_ids=id)": ("space_ids[0]", lambda c, v: make_goodmem_tools(c, v)),
+    "make_goodmem_tools(reranker_id)": (
+        "reranker_id",
+        lambda c, v: make_goodmem_tools(c, [SPACE], reranker_id=v),
+    ),
+}
+
+
+class TestConfiguredIdsFailAtStartup:
+    @pytest.mark.parametrize("name", list(BUILD_CALLS))
+    def test_a_configured_id_that_is_not_a_uuid_fails_when_built(self, wire, name):
+        server, client = wire
+        field, build = BUILD_CALLS[name]
+        assert_refused_before_any_request(server, lambda v: build(client, v), field)
+
+    def test_a_single_uuid_object_is_accepted_as_the_space(self, wire):
+        """A lone ``uuid.UUID`` is one space, as a lone string is -- not an iterable to unpack."""
+        server, client = wire
+        space = uuid.UUID(SPACE)
+        client.retrieve("q", space)
+        GoodMemRM(space_ids=space, client=client)("q")
+        make_goodmem_tools(client, space)[0]("q")
+        assert _paths(server) == ["POST /v1/memories:retrieve"] * 3
+        for _, _, body in server.requests:
+            assert [key["spaceId"] for key in json.loads(body)["spaceKeys"]] == [SPACE]

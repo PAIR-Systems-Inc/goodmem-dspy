@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from dspy_goodmem._filters import from_mapping
-from dspy_goodmem._ids import GoodMemIdError, UUIDStr, require_uuid, require_uuids
+from dspy_goodmem._ids import GoodMemIdError, UUIDStr, id_list, require_uuid, require_uuids
 from dspy_goodmem._results import (
     RetrievalOutcome,
     log_if_degraded,
@@ -203,7 +203,7 @@ class GoodMemClient:
         Raises:
             GoodMemIdError: If a space id or the reranker id is not a UUID.
         """
-        ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        ids = id_list(space_ids)
         if not ids:
             raise GoodMemError("At least one space id is required.")
         ids = require_uuids(ids, "space_ids")
