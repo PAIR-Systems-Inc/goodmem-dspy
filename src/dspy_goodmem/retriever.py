@@ -24,6 +24,7 @@ from typing import Any
 import dspy
 
 from dspy_goodmem._dotdict import dotdict
+from dspy_goodmem._ids import require_uuid, require_uuids
 from dspy_goodmem.client import GoodMemClient
 
 logger = logging.getLogger(__name__)
@@ -33,20 +34,26 @@ class GoodMemRM(dspy.Retrieve):
     """Retrieve passages from GoodMem spaces.
 
     Args:
-        space_ids: One space id, or several.
+        space_ids: One space id, or several. Each must be a UUID.
         api_key: GoodMem API key. Falls back to ``GOODMEM_API_KEY``.
         base_url: GoodMem server URL. Falls back to ``GOODMEM_BASE_URL``.
         k: How many passages to return.
         verify_ssl: Whether to verify TLS certificates. Leave this on; it
             exists for self-signed development servers only.
         timeout: Per-request timeout in seconds.
-        reranker_id: A reranker to apply to retrieval.
+        reranker_id: A reranker to apply to retrieval, by UUID.
         min_score: Drop passages scoring below this value. Applies only with
             a reranker configured, because reranker scales are
             provider-dependent. Off by default.
         metadata_filter: Metadata every retrieved memory must match, applied
             server-side.
         client: An already-configured :class:`GoodMemClient` to reuse.
+
+    Raises:
+        ValueError: If no space id is given.
+        GoodMemIdError: If a space id or the reranker id is not a UUID --
+            checked here so a misconfiguration fails at startup, and again
+            by the client on every retrieval.
     """
 
     def __init__(
@@ -67,7 +74,8 @@ class GoodMemRM(dspy.Retrieve):
         self.space_ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
         if not self.space_ids:
             raise ValueError("GoodMemRM needs at least one space id.")
-        self.reranker_id = reranker_id
+        self.space_ids = require_uuids(self.space_ids, "space_ids")
+        self.reranker_id = require_uuid(reranker_id, "reranker_id") if reranker_id is not None else None
         self.min_score = min_score
         self.metadata_filter = dict(metadata_filter or {})
         self._owns_client = client is None

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from dspy_goodmem._filters import from_mapping
+from dspy_goodmem._ids import GoodMemIdError, UUIDStr, require_uuid, require_uuids
 from dspy_goodmem._results import (
     RetrievalOutcome,
     log_if_degraded,
@@ -180,10 +181,10 @@ class GoodMemClient:
     def retrieve(
         self,
         query: str,
-        space_ids: str | list[str],
+        space_ids: UUIDStr | list[UUIDStr],
         *,
         max_results: int = 5,
-        reranker_id: str | None = None,
+        reranker_id: UUIDStr | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> RetrievalOutcome:
         """Retrieve chunks relevant to a query.
@@ -198,10 +199,16 @@ class GoodMemClient:
 
         Returns:
             The hits and any statuses the server reported.
+
+        Raises:
+            GoodMemIdError: If a space id or the reranker id is not a UUID.
         """
         ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
         if not ids:
             raise GoodMemError("At least one space id is required.")
+        ids = require_uuids(ids, "space_ids")
+        if reranker_id is not None:
+            reranker_id = require_uuid(reranker_id, "reranker_id")
         expression = from_mapping(metadata_filter or {})
         keys: list[dict[str, Any]] = []
         for space_id in ids:
@@ -235,7 +242,7 @@ class GoodMemClient:
 
     def create_memory(
         self,
-        space_id: str,
+        space_id: UUIDStr,
         *,
         text_content: str | None = None,
         file_name: str | None = None,
@@ -266,6 +273,7 @@ class GoodMemClient:
         Returns:
             ``success``, ``memoryId``, ``spaceId`` and ``status``.
         """
+        space_id = require_uuid(space_id, "space_id")
         file_name = file_name or file_path
         if not text_content and not file_name:
             raise GoodMemError("Provide text_content or file_name.")
@@ -295,7 +303,7 @@ class GoodMemClient:
             "status": str(getattr(memory, "processing_status", "") or ""),
         }
 
-    def get_memory(self, memory_id: str, *, include_content: bool = False) -> dict[str, Any]:
+    def get_memory(self, memory_id: UUIDStr, *, include_content: bool = False) -> dict[str, Any]:
         """Fetch one memory, optionally with its original content.
 
         Content is decoded by the memory's own content type: text as text,
@@ -303,6 +311,7 @@ class GoodMemClient:
         A content fetch that fails is an error, not a successful result with
         a note in it.
         """
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             memory = self._client.memories.get(id=memory_id)
         except Exception as exc:
@@ -319,8 +328,9 @@ class GoodMemClient:
             result["content"], result["contentEncoding"] = _decode_content(raw, content_type)
         return result
 
-    def list_memories(self, space_id: str) -> list[dict[str, Any]]:
+    def list_memories(self, space_id: UUIDStr) -> list[dict[str, Any]]:
         """List memories in a space, following pagination."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             page = self._client.memories.list(space_id=space_id, max_items=self.max_list_items)
             memories = list(page)
@@ -337,8 +347,9 @@ class GoodMemClient:
             for m in memories
         ]
 
-    def delete_memory(self, memory_id: str) -> dict[str, Any]:
+    def delete_memory(self, memory_id: UUIDStr) -> dict[str, Any]:
         """Permanently delete a memory and everything derived from it."""
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             self._client.memories.delete(id=memory_id)
         except Exception as exc:
@@ -379,13 +390,14 @@ class GoodMemClient:
             for e in embedders
         ]
 
-    def create_space(self, name: str, embedder_id: str) -> dict[str, Any]:
+    def create_space(self, name: str, embedder_id: UUIDStr) -> dict[str, Any]:
         """Create a space, or reuse one whose embedder already matches.
 
         A space cannot change embedder after creation, so reusing by name
         alone silently writes vectors from a different model than the caller
         asked for. Reuse requires a match; a mismatch names both.
         """
+        embedder_id = require_uuid(embedder_id, "embedder_id")
         try:
             existing = [
                 s
@@ -432,7 +444,7 @@ class GoodMemClient:
 
     def update_space(
         self,
-        space_id: str,
+        space_id: UUIDStr,
         *,
         name: str | None = None,
         labels: dict[str, str] | None = None,
@@ -443,6 +455,7 @@ class GoodMemClient:
         ``publicRead`` is deliberately not offered: the server removed the
         field and rejects any request carrying it with HTTP 400.
         """
+        space_id = require_uuid(space_id, "space_id")
         request: dict[str, Any] = {}
         if name is not None:
             request["name"] = name
@@ -460,8 +473,9 @@ class GoodMemClient:
             "name": str(getattr(space, "name", "") or ""),
         }
 
-    def get_space(self, space_id: str) -> dict[str, Any]:
+    def get_space(self, space_id: UUIDStr) -> dict[str, Any]:
         """Fetch one space by id."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             space = self._client.spaces.get(id=space_id)
         except Exception as exc:
@@ -474,8 +488,9 @@ class GoodMemClient:
             "labels": dict(getattr(space, "labels", None) or {}),
         }
 
-    def delete_space(self, space_id: str) -> dict[str, Any]:
+    def delete_space(self, space_id: UUIDStr) -> dict[str, Any]:
         """Permanently delete a space and every memory in it."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             self._client.spaces.delete(id=space_id)
         except Exception as exc:
@@ -483,4 +498,4 @@ class GoodMemClient:
         return {"success": True, "spaceId": space_id}
 
 
-__all__ = ["GoodMemClient", "GoodMemError", "GoodMemUploadError", "warnings"]
+__all__ = ["GoodMemClient", "GoodMemError", "GoodMemIdError", "GoodMemUploadError", "warnings"]

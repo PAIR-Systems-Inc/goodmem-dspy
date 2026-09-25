@@ -5,12 +5,18 @@
 ``file_path``. A model does not need to administer a memory server in order
 to use one, so the default surface here is a search and a write; everything
 else is opt-in and chosen by the developer.
+
+Every id an opt-in tool accepts is declared a UUID in the schema the model is
+shown, and the client refuses anything else before a request is made: the
+SDK puts ids into URL paths, where ``../spaces/<id>`` passed as a memory id
+would otherwise delete a whole space.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
+from dspy_goodmem._ids import require_uuid, require_uuids
 from dspy_goodmem.client import GoodMemClient
 
 
@@ -29,14 +35,14 @@ def make_goodmem_tools(
 
     Args:
         client: A configured :class:`GoodMemClient`.
-        space_ids: The space or spaces the agent may read and write. The
-            model never chooses a space.
+        space_ids: The space or spaces the agent may read and write, by
+            UUID. The model never chooses a space.
         allow_write: Whether the agent may store new memories.
         allow_admin: Whether space and embedder management is exposed.
         allow_delete: Whether the agent may delete memories and spaces.
         allow_upload: Whether the agent may upload files. Requires the client
             to have been given an ``upload_dir``.
-        reranker_id: A reranker applied to the agent's searches.
+        reranker_id: A reranker applied to the agent's searches, by UUID.
         metadata_filter: Metadata every retrieved memory must match.
 
     Returns:
@@ -44,10 +50,14 @@ def make_goodmem_tools(
 
     Raises:
         ValueError: If uploads are requested without an ``upload_dir``.
+        GoodMemIdError: If a space id or the reranker id is not a UUID.
     """
     ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
     if not ids:
         raise ValueError("make_goodmem_tools() needs at least one space id.")
+    ids = require_uuids(ids, "space_ids")
+    if reranker_id is not None:
+        reranker_id = require_uuid(reranker_id, "reranker_id")
     if allow_upload and client.upload_dir is None:
         raise ValueError(
             "allow_upload=True requires the client to be constructed with "
