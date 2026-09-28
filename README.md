@@ -4,7 +4,8 @@
 a retriever and a set of agent tools. Documents are chunked, embedded and
 searched server-side; this package wraps the official `goodmem` Python SDK.
 
-**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
+**Version 0.2.1.** 0.2.0 was verified against GoodMem server **v1.0.320**;
+the id checks 0.2.1 adds run before any request and are tested offline.
 
 > **Upgrading from 0.1.1.** 0.1.1 talked to GoodMem over hand-written HTTP. A
 > retrieval that *failed* — a space whose embedder was unavailable, say —
@@ -96,6 +97,10 @@ rejects.
 | `allow_delete=True` | `delete_memory`, `delete_space` |
 | `allow_write=False` | removes `goodmem_remember` |
 
+Every id argument these tools take is declared a UUID in the schema the model
+is shown on DSPy 3.x, and refused by the client if it is not one — see
+[Ids](#ids).
+
 ## Metadata filters
 
 Filters are expressions evaluated server-side, not SQL. Build them with the
@@ -104,7 +109,7 @@ Filters are expressions evaluated server-side, not SQL. Build them with the
 ```python
 from dspy_goodmem import GoodMemRM, filters
 
-rm = GoodMemRM(space_ids=["..."], metadata_filter={"tenant": "acme", "active": True})
+rm = GoodMemRM(space_ids=["<space-uuid>"], metadata_filter={"tenant": "acme", "active": True})
 
 expression = filters.all_of(
     filters.equals("tenant", "acme"),
@@ -127,6 +132,41 @@ that directory, so a model-supplied path cannot read arbitrary host files.
 ```python
 client = GoodMemClient(upload_dir="/srv/agent-uploads")
 ```
+
+## Ids
+
+Every id — space, memory, embedder, reranker — must be a canonical UUID
+(either case; it is sent lowercase). Anything else raises `GoodMemIdError`, a
+`ValueError`, **before any request is made**, because the GoodMem SDK puts ids
+into URL paths as they are and `httpx` resolves `..`: on 0.2.0,
+`delete_memory("../spaces/<id>")` was sent as `DELETE /v1/spaces/<id>` and
+reported success. `GoodMemRM` and `make_goodmem_tools` check their configured
+ids when built, and the client checks every id again on every call; that
+client check is the guard, on every DSPy version. On DSPy 3.x the opt-in tools
+also declare each id argument with the UUID pattern, so the model is told and
+`dspy.Tool` refuses a mismatch first. DSPy 2.5 shows the model only the type
+name `UUIDStr` and passes arguments through unchecked, so there the client's
+`GoodMemIdError` is what refuses.
+
+The id sent is always a plain string made from the characters that were
+checked, so a `str` subclass that overrides `lower()` or `__str__` cannot swap
+in a different path after the check, and a `uuid.UUID` whose text is not a
+UUID is refused. A single `uuid.UUID` is accepted wherever one space id or a
+list is.
+
+## Changes in 0.2.1
+
+0.2.0 was tagged but never published to PyPI, so 0.2.1 is the first release
+of this line to ship. Measured offline with the production client talking to
+a local HTTP server that records every request.
+
+| Was (0.2.0) | Now |
+| --- | --- |
+| `delete_memory("../spaces/<id>")` — a developer call, or the model through `allow_delete=True` — was sent as `DELETE /v1/spaces/<id>` and returned `success: true`; `delete_space`, `get_space`, `update_space`, `get_memory` and `list_memories` sent a rewritten path the same way | Refused with `GoodMemIdError`; nothing is sent |
+| 262 of 300 hostile calls (30 call paths × 10 ids such as `../spaces/<id>`, `%2e%2e/spaces/<id>`, `<id>?x=1`, `<id>#frag`) reached the server, 244 of them returning a result | 0 of 300 |
+| Tool id arguments were a bare `string` in the schema the model sees | A UUID pattern and description (DSPy 3.x; DSPy 2.5 shows the type name `UUIDStr`) |
+| A lone `uuid.UUID` as `space_ids` (`retrieve`, `GoodMemRM`, `make_goodmem_tools`) raised `TypeError: 'UUID' object is not iterable` | Treated as one space |
+| 55 offline + 19 live tests | 138 offline + 20 live |
 
 ## Changes in 0.2.0
 
@@ -154,8 +194,8 @@ Reproduced against the published 0.1.1 wheel, live against GoodMem v1.0.320.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_dspy_goodmem.py` | 55 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
-| `tests/test_dspy_goodmem_live.py` | 19 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/test_dspy_goodmem.py` | 138 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server, plus a local recording HTTP server for the id checks |
+| `tests/test_dspy_goodmem_live.py` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 pip install -e . pytest httpx "ruff==0.7.4" mypy

@@ -13,7 +13,7 @@ import warnings
 
 import pytest
 
-from dspy_goodmem import GoodMemClient, GoodMemError, GoodMemRM, make_goodmem_tools
+from dspy_goodmem import GoodMemClient, GoodMemError, GoodMemIdError, GoodMemRM, make_goodmem_tools
 from dspy_goodmem._uploads import GoodMemUploadError
 
 API_KEY = os.environ.get("GOODMEM_API_KEY")
@@ -185,10 +185,18 @@ class TestLiveSpaces:
             client.create_space(f"dspy-live-{RUN}", _other_embedder_id(client))
 
     def test_a_rejected_create_carries_the_servers_message(self, client):
+        """A well-formed id the server does not know; a malformed one never leaves the client."""
         with pytest.raises(GoodMemError) as err:
-            client.create_space(f"dspy-live-bad-{RUN}", "not-a-uuid")
-        assert err.value.status_code == 400
-        assert "embedder" in str(err.value).lower()
+            created = client.create_space(f"dspy-live-bad-{RUN}", str(uuid.uuid4()))
+            client.delete_space(created["spaceId"])  # reached only if the server accepted it
+        assert err.value.status_code is not None and 400 <= err.value.status_code < 500
+        assert err.value.body
+
+    def test_a_traversal_id_cannot_delete_a_space(self, client, space):
+        """0.2.0 sent delete_memory("../spaces/<id>") as DELETE /v1/spaces/<id>."""
+        with pytest.raises(GoodMemIdError, match="memory_id must be a UUID"):
+            client.delete_memory(f"../spaces/{space}")
+        assert client.get_space(space)["spaceId"] == space
 
     def test_listing_is_paginated_and_unique(self, client):
         spaces = client.list_spaces()

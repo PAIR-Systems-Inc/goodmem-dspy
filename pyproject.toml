@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dspy-goodmem"
-version = "0.2.0"
+version = "0.2.1"
 description = "GoodMem integration for DSPy"
 readme = "README.md"
 license = "MIT"
@@ -25,6 +25,8 @@ classifiers = [
 dependencies = [
     "dspy>=2.5.0",
     "goodmem>=0.1.35",
+    "pydantic>=2.0",
+    "typing-extensions>=4.7.1",
 ]
 
 [project.optional-dependencies]
