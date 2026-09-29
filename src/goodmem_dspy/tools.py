@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from dspy_goodmem._ids import id_list, require_uuid, require_uuids
-from dspy_goodmem.client import GoodMemClient
+from goodmem_dspy._ids import id_list, require_uuid, require_uuids
+from goodmem_dspy.client import GoodMemClient
 
 
 def make_goodmem_tools(

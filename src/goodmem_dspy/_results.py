@@ -1,6 +1,6 @@
 r"""Shared handling of a GoodMem retrieval stream.
 
-Both :class:`~dspy_goodmem.GoodMemRM` and the GoodMem tools consume
+Both :class:`~goodmem_dspy.GoodMemRM` and the GoodMem tools consume
 retrieval through this module, so the two cannot drift apart in how they
 classify a status, join a chunk to its memory, or orient a score.
 """

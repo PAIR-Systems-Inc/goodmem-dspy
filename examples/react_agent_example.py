@@ -53,7 +53,7 @@ import time
 
 import dspy
 
-from dspy_goodmem import GoodMemClient, GoodMemError, make_goodmem_tools
+from goodmem_dspy import GoodMemClient, GoodMemError, make_goodmem_tools
 
 try:  # python-dotenv is optional
     from dotenv import load_dotenv
@@ -68,7 +68,7 @@ REQUIRED_ENV_VARS = [
     ("OPENAI_API_KEY", "OpenAI API key used by the default dspy.LM."),
 ]
 
-SPACE_NAME = "dspy-goodmem-react-example"
+SPACE_NAME = "goodmem-dspy-react-example"
 
 SCENARIO_1_TURNS = [
     "I live in Austin, Texas.",

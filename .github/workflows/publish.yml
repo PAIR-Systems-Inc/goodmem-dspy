@@ -4,8 +4,9 @@ name: Publish to PyPI
 # `v*` git tag is pushed. Authentication uses PyPI Trusted Publishing (OIDC);
 # no API token is stored as a GitHub secret.
 #
-# One-time setup on PyPI (the project already exists):
-#   https://pypi.org/manage/project/dspy-goodmem/settings/publishing/
+# One-time setup on PyPI (the project already exists, under the pairsysai
+# organisation):
+#   https://pypi.org/manage/project/goodmem-dspy/settings/publishing/
 #     Owner:       PAIR-Systems-Inc
 #     Repository:  goodmem-dspy
 #     Workflow:    publish.yml
@@ -60,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/dspy-goodmem/
+      url: https://pypi.org/project/goodmem-dspy/
     permissions:
       id-token: write
     steps:
