@@ -5,10 +5,14 @@ semantic retrieval against one or more GoodMem spaces.
 
 Example::
 
+    import dspy
     from dspy_goodmem import GoodMemRM
 
     rm = GoodMemRM(space_ids=["<space-uuid>"], k=3)
-    passages = rm("What is the main finding?")
+    passages = rm("What is the main finding?").passages
+
+    dspy.settings.configure(rm=rm)
+    texts = dspy.Retrieve(k=3)("What is the main finding?").passages
 
 Each passage is a ``dotdict`` carrying ``long_text`` -- what DSPy consumes --
 alongside the identifiers and score that 0.1.1 discarded, so a program can
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Iterable
 from typing import Any
 
 import dspy
@@ -28,6 +33,43 @@ from dspy_goodmem._ids import id_list, require_uuid, require_uuids
 from dspy_goodmem.client import GoodMemClient
 
 logger = logging.getLogger(__name__)
+
+
+class GoodMemPassages(list[dotdict]):
+    """The passages one :class:`GoodMemRM` call returned.
+
+    A plain list of passage ``dotdict`` objects -- the shape DSPy's own
+    retrievers return and the one ``dspy.Retrieve`` iterates, reading
+    ``long_text`` from each -- that also answers ``.passages`` with itself,
+    so ``rm(query).passages`` works as well.
+
+    0.2.0 and 0.2.1 returned a ``dspy.Prediction`` instead. Iterating a
+    ``Prediction`` yields its key names, so with the retriever configured as
+    ``dspy.settings.rm`` every ``dspy.Retrieve`` call raised
+    ``AttributeError: 'str' object has no attribute 'long_text'``.
+
+    Attributes:
+        partial: ``True`` when the server reported a problem during this
+            retrieval -- including when no passage came back, which a bare
+            empty list could not otherwise tell apart from an empty index.
+        statuses: The problems the server reported, as plain dictionaries.
+    """
+
+    def __init__(
+        self,
+        passages: Iterable[dotdict] = (),
+        *,
+        partial: bool = False,
+        statuses: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(passages)
+        self.partial = partial
+        self.statuses = list(statuses or [])
+
+    @property
+    def passages(self) -> GoodMemPassages:
+        """The passages themselves, as ``dspy.Prediction.passages`` would be."""
+        return self
 
 
 class GoodMemRM(dspy.Retrieve):
@@ -42,9 +84,10 @@ class GoodMemRM(dspy.Retrieve):
             exists for self-signed development servers only.
         timeout: Per-request timeout in seconds.
         reranker_id: A reranker to apply to retrieval, by UUID.
-        min_score: Drop passages scoring below this value. Applies only with
-            a reranker configured, because reranker scales are
-            provider-dependent. Off by default.
+        min_score: Drop passages scoring below this value. Applies only to
+            reranker scores, because reranker scales are provider-dependent:
+            not without ``reranker_id``, and not when the server reports that
+            reranking failed and returns vector hits instead. Off by default.
         metadata_filter: Metadata every retrieved memory must match, applied
             server-side.
         client: An already-configured :class:`GoodMemClient` to reuse.
@@ -86,21 +129,22 @@ class GoodMemRM(dspy.Retrieve):
             timeout=timeout,
         )
 
-    def forward(self, query_or_queries: str | list[str], k: int | None = None) -> dspy.Prediction:
+    def forward(self, query_or_queries: str | list[str], k: int | None = None) -> GoodMemPassages:
         """Retrieve passages for one query or several.
 
         A retrieval the server reported a problem for still returns whatever
-        passages arrived; a DSPy ``Prediction`` has no slot for a flag on an
-        empty result, so a degraded retrieval that returns nothing raises a
-        ``UserWarning`` and logs at WARNING with the server's own reason --
-        rather than looking like a clean miss.
+        passages arrived, each flagged ``goodmem_partial``. A degraded
+        retrieval that returns nothing comes back empty with ``partial`` set,
+        and also raises a ``UserWarning`` and logs at WARNING with the
+        server's own reason -- rather than looking like a clean miss.
 
         Args:
             query_or_queries: The query, or a list of queries.
             k: Override the configured number of passages.
 
         Returns:
-            ``dspy.Prediction`` with ``passages``.
+            A :class:`GoodMemPassages` list of passages, which ``dspy.Retrieve``
+            consumes directly and which also answers ``.passages``.
         """
         queries = [query_or_queries] if isinstance(query_or_queries, str) else list(query_or_queries)
         queries = [q for q in queries if q]
@@ -122,7 +166,10 @@ class GoodMemRM(dspy.Retrieve):
                 degraded.extend(outcome.status_dicts)
 
             hits = outcome.hits
-            if self.min_score is not None and self.reranker_id:
+            # A reranker threshold applies only to reranker scores. When the
+            # reranker failed, the server returns vector hits instead; the
+            # threshold would discard what the server returned (Q4a).
+            if self.min_score is not None and outcome.reranked:
                 kept = [h for h in hits if h.score is not None and h.score >= self.min_score]
                 if hits and not kept:
                     observed = [h.score for h in hits if h.score is not None]
@@ -165,4 +212,8 @@ class GoodMemRM(dspy.Retrieve):
             warnings.warn(message, UserWarning, stacklevel=2)
             logger.warning(message)
 
-        return dspy.Prediction(passages=passages[:limit] if limit else passages)
+        return GoodMemPassages(
+            passages[:limit] if limit else passages,
+            partial=bool(degraded),
+            statuses=degraded,
+        )

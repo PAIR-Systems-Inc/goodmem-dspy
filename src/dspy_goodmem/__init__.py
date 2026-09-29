@@ -6,6 +6,7 @@ from dspy_goodmem._ids import GoodMemIdError
 from dspy_goodmem._results import (
     INFORMATIONAL_CODES,
     MALFORMED_STREAM_CODE,
+    RERANKING_FAILED_CODE,
     UNKNOWN_CODE,
     RetrievalHit,
     RetrievalOutcome,
@@ -13,13 +14,14 @@ from dspy_goodmem._results import (
 )
 from dspy_goodmem._uploads import GoodMemUploadError
 from dspy_goodmem.client import GoodMemClient, GoodMemError
-from dspy_goodmem.retriever import GoodMemRM
+from dspy_goodmem.retriever import GoodMemPassages, GoodMemRM
 from dspy_goodmem.tools import make_goodmem_tools
 
 __version__ = "0.2.1"
 
 __all__ = [
     "GoodMemRM",
+    "GoodMemPassages",
     "GoodMemClient",
     "GoodMemError",
     "GoodMemFilterError",
@@ -30,6 +32,7 @@ __all__ = [
     "RetrievalStatus",
     "INFORMATIONAL_CODES",
     "MALFORMED_STREAM_CODE",
+    "RERANKING_FAILED_CODE",
     "UNKNOWN_CODE",
     "make_goodmem_tools",
     "filters",
