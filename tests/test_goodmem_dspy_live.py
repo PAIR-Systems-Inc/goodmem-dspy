@@ -1,4 +1,4 @@
-"""Live tests for dspy-goodmem, against a running GoodMem server.
+"""Live tests for goodmem-dspy, against a running GoodMem server.
 
 These skip entirely unless ``GOODMEM_API_KEY`` and ``GOODMEM_BASE_URL`` are
 set, which is also the check that no credential is baked into the package.
@@ -14,8 +14,8 @@ import warnings
 import dspy
 import pytest
 
-from dspy_goodmem import GoodMemClient, GoodMemError, GoodMemIdError, GoodMemRM, make_goodmem_tools
-from dspy_goodmem._uploads import GoodMemUploadError
+from goodmem_dspy import GoodMemClient, GoodMemError, GoodMemIdError, GoodMemRM, make_goodmem_tools
+from goodmem_dspy._uploads import GoodMemUploadError
 
 API_KEY = os.environ.get("GOODMEM_API_KEY")
 BASE_URL = os.environ.get("GOODMEM_BASE_URL")

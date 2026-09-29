@@ -2,7 +2,7 @@
 
 Example::
 
-    from dspy_goodmem import filters
+    from goodmem_dspy import filters
 
     expression = filters.all_of(
         filters.equals("tenant", "acme"),
@@ -10,7 +10,7 @@ Example::
     )
 """
 
-from dspy_goodmem._filters import (
+from goodmem_dspy._filters import (
     GoodMemFilterError,
     all_of,
     any_of,

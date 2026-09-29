@@ -1,9 +1,9 @@
 """GoodMem integration for DSPy: a retriever and agent tools."""
 
-from dspy_goodmem import filters
-from dspy_goodmem._filters import GoodMemFilterError
-from dspy_goodmem._ids import GoodMemIdError
-from dspy_goodmem._results import (
+from goodmem_dspy import filters
+from goodmem_dspy._filters import GoodMemFilterError
+from goodmem_dspy._ids import GoodMemIdError
+from goodmem_dspy._results import (
     INFORMATIONAL_CODES,
     MALFORMED_STREAM_CODE,
     RERANKING_FAILED_CODE,
@@ -12,12 +12,12 @@ from dspy_goodmem._results import (
     RetrievalOutcome,
     RetrievalStatus,
 )
-from dspy_goodmem._uploads import GoodMemUploadError
-from dspy_goodmem.client import GoodMemClient, GoodMemError
-from dspy_goodmem.retriever import GoodMemPassages, GoodMemRM
-from dspy_goodmem.tools import make_goodmem_tools
+from goodmem_dspy._uploads import GoodMemUploadError
+from goodmem_dspy.client import GoodMemClient, GoodMemError
+from goodmem_dspy.retriever import GoodMemPassages, GoodMemRM
+from goodmem_dspy.tools import make_goodmem_tools
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "GoodMemRM",

@@ -6,7 +6,7 @@ semantic retrieval against one or more GoodMem spaces.
 Example::
 
     import dspy
-    from dspy_goodmem import GoodMemRM
+    from goodmem_dspy import GoodMemRM
 
     rm = GoodMemRM(space_ids=["<space-uuid>"], k=3)
     passages = rm("What is the main finding?").passages
@@ -28,9 +28,9 @@ from typing import Any
 
 import dspy
 
-from dspy_goodmem._dotdict import dotdict
-from dspy_goodmem._ids import id_list, require_uuid, require_uuids
-from dspy_goodmem.client import GoodMemClient
+from goodmem_dspy._dotdict import dotdict
+from goodmem_dspy._ids import id_list, require_uuid, require_uuids
+from goodmem_dspy.client import GoodMemClient
 
 logger = logging.getLogger(__name__)
 

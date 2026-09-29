@@ -1,22 +1,16 @@
-# dspy-goodmem
+# goodmem-dspy
 
 [GoodMem](https://docs.goodmem.ai) memory for [DSPy](https://github.com/stanfordnlp/dspy):
 a retriever and a set of agent tools. Documents are chunked, embedded and
 searched server-side; this package wraps the official `goodmem` Python SDK.
 
-**Version 0.2.1.** 0.2.0 was verified against GoodMem server **v1.0.320**;
-the id checks 0.2.1 adds run before any request and are tested offline.
-
-> **Upgrading from 0.1.1.** 0.1.1 talked to GoodMem over hand-written HTTP. A
-> retrieval that *failed* — a space whose embedder was unavailable, say —
-> returned `success: true` with zero results and no indication anything had
-> gone wrong, indistinguishable from an empty index. See
-> [Changes in 0.2.0](#changes-in-020).
+**Version 0.3.0.** 0.2.0 was verified against GoodMem server **v1.0.320**;
+0.3.0 against the monthly end-to-end run (dspy 3.4.0, 17 of 17 checks).
 
 ## Install
 
 ```bash
-pip install dspy-goodmem
+pip install goodmem-dspy
 export GOODMEM_API_KEY="gm_your_key_here"
 export GOODMEM_BASE_URL="https://your-goodmem-server"
 ```
@@ -25,7 +19,7 @@ export GOODMEM_BASE_URL="https://your-goodmem-server"
 
 ```python
 import dspy
-from dspy_goodmem import GoodMemRM
+from goodmem_dspy import GoodMemRM
 
 rm = GoodMemRM(space_ids=["<space-uuid>"], k=3)
 
@@ -95,7 +89,7 @@ fallback's vector hits.
 
 ```python
 import dspy
-from dspy_goodmem import GoodMemClient, make_goodmem_tools
+from goodmem_dspy import GoodMemClient, make_goodmem_tools
 
 client = GoodMemClient()
 tools = make_goodmem_tools(client, space_ids=["<space-uuid>"])
@@ -124,7 +118,7 @@ Filters are expressions evaluated server-side, not SQL. Build them with the
 `filters` helper rather than by string interpolation:
 
 ```python
-from dspy_goodmem import GoodMemRM, filters
+from goodmem_dspy import GoodMemRM, filters
 
 rm = GoodMemRM(space_ids=["<space-uuid>"], metadata_filter={"tenant": "acme", "active": True})
 
@@ -171,9 +165,14 @@ in a different path after the check, and a `uuid.UUID` whose text is not a
 UUID is refused. A single `uuid.UUID` is accepted wherever one space id or a
 list is.
 
-## Changes in 0.2.2 (unreleased)
+## Changes in 0.3.0
 
-Both defects were found by the monthly end-to-end run against dspy 3.4.0 and
+**Renamed to `goodmem-dspy` (import `goodmem_dspy`)**, the `goodmem-<framework>`
+naming used by goodmem-adk and goodmem-semantic-kernel. **Breaking:** update
+imports from `dspy_goodmem` to `goodmem_dspy`. 0.2.0 and 0.2.1 were tagged but
+never reached PyPI, so 0.3.0 is the first release since 0.1.1.
+
+Two defects were found by the monthly end-to-end run against dspy 3.4.0 and
 are measured below with the same script against 0.2.1 and this release: live
 against GoodMem at `localhost:8080`, and offline replaying streams captured
 from that server on 2026-09-29.
@@ -226,20 +225,20 @@ Reproduced against the published 0.1.1 wheel, live against GoodMem v1.0.320.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_dspy_goodmem.py` | 157 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server, plus a local recording HTTP server for the id checks |
-| `tests/test_dspy_goodmem_live.py` | 23 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/test_goodmem_dspy.py` | 157 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server, plus a local recording HTTP server for the id checks |
+| `tests/test_goodmem_dspy_live.py` | 23 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 pip install -e . pytest httpx "ruff==0.7.4" mypy
 
-pytest tests/test_dspy_goodmem.py
+pytest tests/test_goodmem_dspy.py
 
 GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
   GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... \
-  pytest tests/test_dspy_goodmem_live.py
+  pytest tests/test_goodmem_dspy_live.py
 
 # what CI runs
-ruff check src tests && ruff format --check src tests && mypy src/dspy_goodmem
+ruff check src tests && ruff format --check src tests && mypy src/goodmem_dspy
 ```
 
 The live suite creates one space per run and asserts, against a fresh server

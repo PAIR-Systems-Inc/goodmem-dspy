@@ -15,14 +15,14 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from dspy_goodmem._filters import from_mapping
-from dspy_goodmem._ids import GoodMemIdError, UUIDStr, id_list, require_uuid, require_uuids
-from dspy_goodmem._results import (
+from goodmem_dspy._filters import from_mapping
+from goodmem_dspy._ids import GoodMemIdError, UUIDStr, id_list, require_uuid, require_uuids
+from goodmem_dspy._results import (
     RetrievalOutcome,
     log_if_degraded,
     outcome_from_events,
 )
-from dspy_goodmem._uploads import GoodMemUploadError, resolve_upload_path
+from goodmem_dspy._uploads import GoodMemUploadError, resolve_upload_path
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,7 @@ class GoodMemClient:
             max_results: How many chunks to ask the server for.
             reranker_id: A reranker to apply, if any.
             metadata_filter: Metadata every memory must match, applied
-                server-side and escaped by :mod:`dspy_goodmem.filters`.
+                server-side and escaped by :mod:`goodmem_dspy.filters`.
 
         Returns:
             The hits and any statuses the server reported.

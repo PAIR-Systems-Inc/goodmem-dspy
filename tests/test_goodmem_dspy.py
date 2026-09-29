@@ -1,4 +1,4 @@
-"""Offline tests for dspy-goodmem.
+"""Offline tests for goodmem-dspy.
 
 These drive the *real* GoodMem SDK over an ``httpx`` mock transport, fed with
 NDJSON and JSON captured from a live GoodMem server (v1.0.320). 0.1.1's suite
@@ -26,22 +26,22 @@ import dspy
 import httpx
 import pytest
 
-from dspy_goodmem import (
+from goodmem_dspy import (
     GoodMemClient,
     GoodMemError,
     GoodMemRM,
     filters,
     make_goodmem_tools,
 )
-from dspy_goodmem._filters import GoodMemFilterError
-from dspy_goodmem._results import (
+from goodmem_dspy._filters import GoodMemFilterError
+from goodmem_dspy._results import (
     MALFORMED_STREAM_CODE,
     UNKNOWN_CODE,
     classify_status,
     orient_score,
     outcome_from_events,
 )
-from dspy_goodmem._uploads import GoodMemUploadError, resolve_upload_path
+from goodmem_dspy._uploads import GoodMemUploadError, resolve_upload_path
 
 FIXTURES = Path(__file__).parent / "goodmem_fixtures"
 BASE = "https://goodmem.test"
@@ -253,10 +253,10 @@ class TestPublicReadRemoved:
     def test_no_public_read_in_any_shipped_code_path(self):
         import ast
 
-        import dspy_goodmem
+        import goodmem_dspy
 
         offenders = []
-        for path in Path(dspy_goodmem.__file__).parent.glob("*.py"):
+        for path in Path(goodmem_dspy.__file__).parent.glob("*.py"):
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -527,7 +527,7 @@ class TestDspyRetrieve:
         assert p.score == pytest.approx(-p.raw_score)
 
     def test_the_result_is_a_list_that_carries_the_degraded_flag(self):
-        from dspy_goodmem import GoodMemPassages
+        from goodmem_dspy import GoodMemPassages
 
         c = make_client(retrieve_handler(fixture("retrieve_degraded_empty.ndjson")))
         with pytest.warns(UserWarning, match="not an empty index"):
@@ -1055,20 +1055,20 @@ class TestIdsMustBeUuids:
 
     def test_only_the_canonical_form_is_accepted(self):
         """``uuid.UUID()`` parses braces, URNs and unhyphenated hex; an id may not."""
-        import dspy_goodmem
-        from dspy_goodmem._ids import require_uuid
+        import goodmem_dspy
+        from goodmem_dspy._ids import require_uuid
 
         assert require_uuid(SPACE.upper(), "space_id") == SPACE
         assert require_uuid(uuid.UUID(SPACE), "space_id") == SPACE
         for bad in (None, 123, SPACE.encode(), SPACE.replace("-", ""), "{" + SPACE + "}", f"urn:uuid:{SPACE}"):
-            with pytest.raises(dspy_goodmem.GoodMemIdError, match="space_id must be a UUID"):
+            with pytest.raises(goodmem_dspy.GoodMemIdError, match="space_id must be a UUID"):
                 require_uuid(bad, "space_id")
 
     def test_the_refusal_is_a_value_error_exported_from_the_package(self):
-        import dspy_goodmem
+        import goodmem_dspy
 
-        assert issubclass(dspy_goodmem.GoodMemIdError, ValueError)
-        assert "GoodMemIdError" in dspy_goodmem.__all__
+        assert issubclass(goodmem_dspy.GoodMemIdError, ValueError)
+        assert "GoodMemIdError" in goodmem_dspy.__all__
 
 
 # What a caller's own object may not do to an id after it has been checked
@@ -1171,7 +1171,7 @@ class TestIdObjectsCannotRewriteThemselves:
         assert create["spaceId"] == SPACE
 
     def test_the_validator_returns_a_plain_lowercase_str(self):
-        from dspy_goodmem._ids import require_uuid
+        from goodmem_dspy._ids import require_uuid
 
         checked = require_uuid(_RewritingStr(SPACE.upper()), "space_id")
         assert type(checked) is str

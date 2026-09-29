@@ -41,10 +41,10 @@ jobs:
           ruff format --check src tests
 
       - name: Types
-        run: mypy src/dspy_goodmem
+        run: mypy src/goodmem_dspy
 
       - name: Offline suite
-        run: pytest tests/test_dspy_goodmem.py -v
+        run: pytest tests/test_goodmem_dspy.py -v
 
       - name: Live tests must skip without credentials
         env:
@@ -52,7 +52,7 @@ jobs:
           GOODMEM_BASE_URL: ""
         run: |
           set -euo pipefail
-          pytest tests/test_dspy_goodmem_live.py -v > live.log 2>&1
+          pytest tests/test_goodmem_dspy_live.py -v > live.log 2>&1
           grep -q "skipped" live.log
           if grep -qE "^tests.*(PASSED|FAILED)" live.log; then
             echo "A live test ran without credentials -- a key may be baked in."
@@ -66,7 +66,7 @@ jobs:
           python -m build
           python -m venv /tmp/clean
           /tmp/clean/bin/pip install --quiet dist/*.whl
-          /tmp/clean/bin/python -c "import dspy_goodmem; print(dspy_goodmem.__version__)"
+          /tmp/clean/bin/python -c "import goodmem_dspy; print(goodmem_dspy.__version__)"
 
   gates:
     runs-on: ubuntu-latest
