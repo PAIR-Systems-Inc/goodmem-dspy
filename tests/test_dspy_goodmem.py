@@ -1,4 +1,4 @@
-"""Offline tests for dspy-goodmem.
+"""Offline tests for goodmem-dspy (import package ``dspy_goodmem``).
 
 These drive the *real* GoodMem SDK over an ``httpx`` mock transport, fed with
 NDJSON and JSON captured from a live GoodMem server (v1.0.320). 0.1.1's suite

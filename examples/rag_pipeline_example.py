@@ -175,7 +175,7 @@ def setup_goodmem(client: GoodMemClient) -> tuple[str, list[str]]:
     # A space is a logical container for related memories, configured with
     # a specific embedder.  create_space() is idempotent: if a space with
     # the same name already exists, it returns the existing space.
-    space_name = "dspy-goodmem-example"
+    space_name = "goodmem-dspy-example"
     print(f"  Creating space '{space_name}'...")
     result = client.create_space(space_name, embedder_id)
     space_id = result["spaceId"]

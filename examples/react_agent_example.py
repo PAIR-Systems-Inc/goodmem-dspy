@@ -68,7 +68,7 @@ REQUIRED_ENV_VARS = [
     ("OPENAI_API_KEY", "OpenAI API key used by the default dspy.LM."),
 ]
 
-SPACE_NAME = "dspy-goodmem-react-example"
+SPACE_NAME = "goodmem-dspy-react-example"
 
 SCENARIO_1_TURNS = [
     "I live in Austin, Texas.",
