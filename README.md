@@ -28,11 +28,18 @@ import dspy
 from dspy_goodmem import GoodMemRM
 
 rm = GoodMemRM(space_ids=["<space-uuid>"], k=3)
-dspy.settings.configure(rm=rm)
 
+# As DSPy's retrieval module: dspy.Retrieve reads dspy.settings.rm.
+dspy.settings.configure(rm=rm)
+texts = dspy.Retrieve(k=3)("What is the main finding?").passages  # list of str
+
+# Directly, keeping scores, ids and metadata:
 passages = rm("What is the main finding?").passages
 ```
 
+Calling the retriever returns a `GoodMemPassages`: a plain list of passages —
+the shape DSPy's own retrievers return and the one `dspy.Retrieve` iterates —
+that also answers `.passages`, plus `.partial` and `.statuses` (see below).
 Each passage is a `dotdict` carrying `long_text` — what DSPy consumes —
 alongside the data 0.1.1 discarded:
 
@@ -51,8 +58,9 @@ alongside the data 0.1.1 discarded:
 ### When retrieval goes wrong
 
 A degraded retrieval still returns whatever passages arrived, each flagged
-with `goodmem_partial`. A `dspy.Prediction` has no slot for a flag on an
-*empty* result, so a degraded retrieval that returns nothing raises a
+with `goodmem_partial`, and the result's own `partial` is `True` with the
+server's `statuses` beside it. A degraded retrieval that returns *nothing*
+comes back as an empty list with `partial` set, and also raises a
 `UserWarning` and logs at WARNING with the server's own reason — rather than
 looking like a clean miss:
 
@@ -70,9 +78,18 @@ on a **provider-dependent** scale — measured live on the same five documents,
 Voyage `rerank-2.5` returned `0.27..0.93` and Jina `jina-reranker-v3` returned
 `-0.14..0.43`.
 
-So there is **no default threshold**; `min_score` applies only when
-`reranker_id` is set, and warns naming the observed range if it removes
-everything.
+`score_kind` says which stage the score came from, as the server reported it
+— not as configured. When a reranker was requested but could not run, GoodMem
+reports `RERANKING_FAILED` (and a `NOT_FOUND` naming the reranker) and still
+returns the vector-stage hits. Those are labelled `"vector"`, flipped to
+higher-is-better like any vector score, and flagged `goodmem_partial`. A
+`NOT_FOUND` naming anything else, such as an LLM, leaves reranker scores as
+they are.
+
+So there is **no default threshold**; `min_score` applies only to reranker
+scores — with `reranker_id` set and the reranker actually run — and warns
+naming the observed range if it removes everything. It never drops a
+fallback's vector hits.
 
 ## Agent tools
 
@@ -154,6 +171,21 @@ in a different path after the check, and a `uuid.UUID` whose text is not a
 UUID is refused. A single `uuid.UUID` is accepted wherever one space id or a
 list is.
 
+## Changes in 0.2.2 (unreleased)
+
+Both defects were found by the monthly end-to-end run against dspy 3.4.0 and
+are measured below with the same script against 0.2.1 and this release: live
+against GoodMem at `localhost:8080`, and offline replaying streams captured
+from that server on 2026-09-29.
+
+| Was (0.2.1) | Now |
+| --- | --- |
+| With `GoodMemRM` configured as `dspy.settings.rm` — exactly as this README said — every `dspy.Retrieve(...)` call raised `AttributeError: 'str' object has no attribute 'long_text'`: the retriever returned a `dspy.Prediction`, which iterates as its key names | Returns `GoodMemPassages`, a list of passage dotdicts that also answers `.passages`; `dspy.Retrieve` returns the passage texts, and `rm(q).passages` keeps working |
+| A requested reranker that failed (`NOT_FOUND` + `RERANKING_FAILED`) left the vector fallback hits labelled `score_kind: "reranker"` with the raw negative value as `score` (live: `-0.4268`, `-0.1455`), so a higher-is-better reader ranked them backwards | Labelled `"vector"`, `score` `0.4268`, `0.1455`, `raw_score` kept; decided after the whole stream is read |
+| `min_score=0.5` on that fallback removed both hits and then warned "this is not an empty index" | Both hits kept, no `min_score` warning; `partial` + statuses as the retrieval status contract says |
+| A degraded empty result was indistinguishable from `[]` except through the warning | `result.partial` and `result.statuses` on the returned list |
+| 138 offline + 20 live tests | 157 offline + 23 live; 17 of the new offline tests fail on 0.2.1 |
+
 ## Changes in 0.2.1
 
 0.2.0 was tagged but never published to PyPI, so 0.2.1 is the first release
@@ -194,8 +226,8 @@ Reproduced against the published 0.1.1 wheel, live against GoodMem v1.0.320.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_dspy_goodmem.py` | 138 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server, plus a local recording HTTP server for the id checks |
-| `tests/test_dspy_goodmem_live.py` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/test_dspy_goodmem.py` | 157 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server, plus a local recording HTTP server for the id checks |
+| `tests/test_dspy_goodmem_live.py` | 23 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 pip install -e . pytest httpx "ruff==0.7.4" mypy
@@ -203,7 +235,7 @@ pip install -e . pytest httpx "ruff==0.7.4" mypy
 pytest tests/test_dspy_goodmem.py
 
 GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
-  GOODMEM_TEST_EMBEDDER_ID=... \
+  GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... \
   pytest tests/test_dspy_goodmem_live.py
 
 # what CI runs

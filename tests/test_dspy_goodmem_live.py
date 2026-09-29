@@ -11,6 +11,7 @@ import time
 import uuid
 import warnings
 
+import dspy
 import pytest
 
 from dspy_goodmem import GoodMemClient, GoodMemError, GoodMemIdError, GoodMemRM, make_goodmem_tools
@@ -20,6 +21,7 @@ API_KEY = os.environ.get("GOODMEM_API_KEY")
 BASE_URL = os.environ.get("GOODMEM_BASE_URL")
 VERIFY_SSL = os.environ.get("GOODMEM_VERIFY_SSL", "false").lower() == "true"
 FAILING_EMBEDDER = os.environ.get("GOODMEM_TEST_FAILING_EMBEDDER_ID")
+RERANKER = os.environ.get("GOODMEM_TEST_RERANKER_ID")
 
 pytestmark = pytest.mark.skipif(
     not (API_KEY and BASE_URL),
@@ -130,6 +132,56 @@ class TestLiveRetriever:
             client.delete_space(empty["spaceId"])
         assert out.passages == []
         assert elapsed < 3.0, f"an empty search took {elapsed:.1f}s"
+
+
+class TestLiveDspyRetrieve:
+    def test_dspy_retrieve_works_with_the_rm_configured(self, client, space, seeded):
+        """README "Retrieve": the retriever as dspy.settings.rm, read by dspy.Retrieve.
+
+        0.2.1 raised AttributeError: 'str' object has no attribute 'long_text'.
+        """
+        canary, _ = seeded
+        rm = GoodMemRM(space_ids=[space], client=client, k=3)
+        with dspy.context(rm=rm):
+            texts = dspy.Retrieve(k=2)(canary).passages
+        assert texts and all(isinstance(t, str) for t in texts)
+        assert canary in texts[0]
+        direct = rm(canary)
+        assert [p.long_text for p in direct] == [p["long_text"] for p in direct.passages]
+
+
+class TestLiveReranker:
+    def test_a_missing_reranker_falls_back_to_vector_scores(self, client, space, seeded):
+        """The server answers NOT_FOUND + RERANKING_FAILED and returns vector hits.
+
+        0.2.1 labelled them "reranker" with the raw negative value as score,
+        and min_score then discarded every one of them.
+        """
+        canary, memory_id = seeded
+        missing = str(uuid.uuid4())
+        rm = GoodMemRM(space_ids=[space], client=client, k=3, reranker_id=missing, min_score=0.99)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            out = rm(canary)
+        assert out.passages, "the fallback hits were discarded"
+        assert out.passages[0].memory_id == memory_id
+        for p in out.passages:
+            assert p.score_kind == "vector" and p.raw_score < 0 and p.score == -p.raw_score
+            assert p.goodmem_partial is True
+        assert out.partial is True
+        assert "RERANKING_FAILED" in {s["code"] for s in out.statuses}
+        assert not [w for w in caught if "min_score" in str(w.message)]
+
+        found = make_goodmem_tools(client, [space], reranker_id=missing)[0](canary, 3)
+        assert found["partial"] is True and found["results"]
+        assert all(h["scoreKind"] == "vector" and h["score"] > 0 for h in found["results"])
+
+    def test_a_working_reranker_labels_reranker_scores(self, client, space, seeded):
+        if not RERANKER:
+            pytest.skip("GOODMEM_TEST_RERANKER_ID is not set")
+        out = GoodMemRM(space_ids=[space], client=client, k=3, reranker_id=RERANKER)(seeded[0])
+        assert out.passages and out.partial is False
+        assert all(p.score_kind == "reranker" and p.score == p.raw_score for p in out.passages)
 
 
 class TestLiveStatusContract:

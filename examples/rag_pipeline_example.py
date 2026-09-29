@@ -237,8 +237,9 @@ class RAG(dspy.Module):
 
     def forward(self, question: str) -> dspy.Prediction:
         # Step 1: Retrieve relevant passages from GoodMem.
-        # GoodMemRM returns a dspy.Prediction whose ``passages`` are dotdicts
-        # carrying ``long_text`` plus the score, ids and metadata of each hit.
+        # GoodMemRM returns a list of dotdicts (which also answers
+        # ``.passages``), each carrying ``long_text`` plus the score, ids and
+        # metadata of each hit.
         passages = self.retriever(question).passages
 
         # Step 2: Combine passages into a single context string.

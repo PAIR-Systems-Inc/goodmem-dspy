@@ -461,6 +461,225 @@ class TestContentAndSecrets:
         assert c._owns_client is False
 
 
+# ---------------------------------------------------------------------------
+# dspy.Retrieve with GoodMemRM configured as dspy.settings.rm
+# ---------------------------------------------------------------------------
+
+#: The fixture stream every test in this block replays: a live retrieval
+#: (2026-09-29) whose two hits are vector-scored.
+RETRIEVE_STREAM = "retrieve_bad_reranker.ndjson"
+CANARY_TEXT = "The fixture canary is ORYX-2290. DSPy retriever audit.\n"
+
+
+def _texts(payload: bytes) -> list[str]:
+    out = []
+    for line in payload.decode().splitlines():
+        if line.strip() and "retrievedItem" in line:
+            out.append(json.loads(line)["retrievedItem"]["chunk"]["chunk"]["chunkText"])
+    return out
+
+
+class TestDspyRetrieve:
+    """README "Retrieve" configures the retriever as ``dspy.settings.rm``;
+    ``dspy.Retrieve`` is the DSPy module that reads that setting. It calls
+    ``rm(query, k=k)`` and reads ``long_text`` from each item it iterates.
+    0.2.1 returned a ``dspy.Prediction``, which iterates as its key names, so
+    every call raised ``AttributeError: 'str' object has no attribute
+    'long_text'``."""
+
+    def test_dspy_retrieve_works_with_the_rm_in_context(self):
+        c = make_client(retrieve_handler(fixture(RETRIEVE_STREAM)))
+        rm = GoodMemRM(space_ids=[SPACE], client=c, k=2)
+        with dspy.context(rm=rm):
+            out = dspy.Retrieve(k=2)("What is the fixture canary?")
+        assert out.passages == _texts(fixture(RETRIEVE_STREAM))
+        assert all(isinstance(t, str) for t in out.passages)
+
+    def test_dspy_retrieve_works_with_the_rm_configured_as_the_readme_says(self):
+        c = make_client(retrieve_handler(fixture(RETRIEVE_STREAM)))
+        rm = GoodMemRM(space_ids=[SPACE], client=c, k=2)
+        dspy.settings.configure(rm=rm)
+        try:
+            out = dspy.Retrieve(k=1)("What is the fixture canary?")
+        finally:
+            dspy.settings.configure(rm=None)
+        assert out.passages == [CANARY_TEXT]
+
+    def test_dspy_retrieve_passes_its_k_to_the_rm(self):
+        capture: dict = {}
+        c = make_client(retrieve_handler(fixture(RETRIEVE_STREAM), capture=capture))
+        with dspy.context(rm=GoodMemRM(space_ids=[SPACE], client=c, k=5)):
+            dspy.Retrieve(k=1)("q")
+        assert capture["body"]["requestedSize"] == 1
+
+    def test_iterating_the_rm_output_yields_passages(self):
+        c = make_client(retrieve_handler(fixture(RETRIEVE_STREAM)))
+        out = GoodMemRM(space_ids=[SPACE], client=c, k=2)("canary")
+        assert [p.long_text for p in out] == _texts(fixture(RETRIEVE_STREAM))
+
+    def test_passages_is_still_available_and_carries_the_metadata(self):
+        c = make_client(retrieve_handler(fixture(RETRIEVE_STREAM)))
+        out = GoodMemRM(space_ids=[SPACE], client=c, k=2)("canary")
+        assert out.passages == list(out)
+        p = out.passages[0]
+        assert p.long_text == CANARY_TEXT
+        assert p.chunk_id and p.memory_id and p.space_id and p.score_kind == "vector"
+        assert p.score == pytest.approx(-p.raw_score)
+
+    def test_the_result_is_a_list_that_carries_the_degraded_flag(self):
+        from dspy_goodmem import GoodMemPassages
+
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_empty.ndjson")))
+        with pytest.warns(UserWarning, match="not an empty index"):
+            out = GoodMemRM(space_ids=[SPACE], client=c)("nothing")
+        assert isinstance(out, GoodMemPassages) and isinstance(out, list)
+        assert out == [] and out.partial is True
+        assert {"NOT_FOUND", "RERANKING_FAILED"} <= {s["code"] for s in out.statuses}
+
+    def test_a_clean_result_is_not_flagged(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        out = GoodMemRM(space_ids=[SPACE], client=c)("canary")
+        assert out and out.partial is False and out.statuses == []
+
+
+# ---------------------------------------------------------------------------
+# A reranker that was requested but failed
+# ---------------------------------------------------------------------------
+
+
+def _lines(name: str) -> list[str]:
+    return [line for line in fixture(name).decode().splitlines() if line.strip()]
+
+
+def _stream(lines: list[str]) -> bytes:
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _status_code(line: str) -> str | None:
+    return json.loads(line).get("status", {}).get("code")
+
+
+class TestRerankerFallback:
+    """With a reranker requested that the server cannot run, GoodMem reports
+    ``NOT_FOUND`` (naming ``reranker_id``) and ``RERANKING_FAILED`` and still
+    returns the vector-stage hits, scored as vector scores. 0.2.1 labelled
+    them from configuration: ``score_kind="reranker"`` with the raw negative
+    value as ``score``, and ``min_score`` then discarded all of them. The
+    fixture is that stream, captured live on 2026-09-29."""
+
+    def test_fallback_passages_are_vector_scored_higher_is_better(self):
+        c = make_client(retrieve_handler(fixture("retrieve_bad_reranker.ndjson")))
+        passages = GoodMemRM(space_ids=[SPACE], client=c, k=2, reranker_id=RERANKER)("canary").passages
+        assert len(passages) == 2
+        for p in passages:
+            assert p.raw_score < 0
+            assert p.score_kind == "vector"
+            assert p.score == pytest.approx(-p.raw_score)
+            assert p.goodmem_partial is True
+        scores = [p.score for p in passages]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_the_search_tool_reports_fallback_hits_as_vector(self):
+        c = make_client(retrieve_handler(fixture("retrieve_bad_reranker.ndjson")))
+        search = make_goodmem_tools(c, [SPACE], reranker_id=RERANKER)[0]
+        out = search("canary", 2)
+        assert out["totalResults"] == 2
+        assert all(h["scoreKind"] == "vector" and h["score"] > 0 for h in out["results"])
+        assert out["partial"] is True and out["warning"]
+        assert {"NOT_FOUND", "RERANKING_FAILED"} <= {s["code"] for s in out["statuses"]}
+
+    def test_min_score_does_not_discard_fallback_hits(self, recwarn):
+        """Q4a: problem + hits -> the hits. min_score is a reranker threshold;
+        on 0.2.1 it removed both hits and then warned that the index was not
+        empty."""
+        c = make_client(retrieve_handler(fixture("retrieve_bad_reranker.ndjson")))
+        rm = GoodMemRM(space_ids=[SPACE], client=c, k=2, reranker_id=RERANKER, min_score=0.9)
+        out = rm("canary")
+        assert len(out.passages) == 2
+        assert out.partial is True
+        assert not [w for w in recwarn if "min_score" in str(w.message)]
+        assert not [w for w in recwarn if "not an empty index" in str(w.message)]
+
+    def test_the_outcome_says_it_was_not_reranked(self):
+        c = make_client(retrieve_handler(fixture("retrieve_bad_reranker.ndjson")))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert outcome.reranked is False
+        assert outcome.partial is True
+        assert [h.score_kind for h in outcome.hits] == ["vector", "vector"]
+
+    def test_reranking_failed_after_the_hits_still_counts(self):
+        """The decision is made once the whole stream is read."""
+        lines = _lines("retrieve_bad_reranker.ndjson")
+        failed = [line for line in lines if _status_code(line) == "RERANKING_FAILED"]
+        rest = [line for line in lines if _status_code(line) not in ("RERANKING_FAILED", "NOT_FOUND")]
+        c = make_client(retrieve_handler(_stream(rest + failed)))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert outcome.reranked is False
+        assert [h.score_kind for h in outcome.hits] == ["vector", "vector"]
+        assert all(h.score > 0 for h in outcome.hits)
+
+    def test_a_not_found_naming_the_reranker_alone_counts(self):
+        lines = [line for line in _lines("retrieve_bad_reranker.ndjson") if _status_code(line) != "RERANKING_FAILED"]
+        c = make_client(retrieve_handler(_stream(lines)))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert [s.code for s in outcome.statuses] == ["NOT_FOUND"]
+        assert outcome.reranked is False
+        assert all(h.score_kind == "vector" and h.score > 0 for h in outcome.hits)
+
+    def test_a_reranker_not_found_without_details_counts_by_its_message(self):
+        lines = []
+        for line in _lines("retrieve_bad_reranker.ndjson"):
+            if _status_code(line) == "RERANKING_FAILED":
+                continue
+            if _status_code(line) == "NOT_FOUND":
+                event = json.loads(line)
+                del event["status"]["details"]
+                line = json.dumps(event)
+            lines.append(line)
+        c = make_client(retrieve_handler(_stream(lines)))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert outcome.reranked is False
+
+    def test_an_llm_not_found_leaves_reranker_scores_alone(self):
+        """Live: a real reranker with a missing LLM. The server reports
+        NOT_FOUND naming ``llm_id`` and SUMMARIZATION_FAILED; the hits were
+        reranked (0.875, 0.25) and must stay labelled so."""
+        c = make_client(retrieve_handler(fixture("retrieve_reranked_bad_llm.ndjson")))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert {s.code for s in outcome.statuses} == {"NOT_FOUND", "SUMMARIZATION_FAILED"}
+        assert outcome.partial is True
+        assert outcome.reranked is True
+        assert [(h.score_kind, h.score) for h in outcome.hits] == [("reranker", 0.875), ("reranker", 0.25)]
+
+    def test_an_unrelated_problem_keeps_reranker_scores(self):
+        lines = _lines("retrieve_reranked_ok.ndjson")
+        future = json.dumps({"status": {"code": "SOME_FUTURE_CODE", "message": "odd"}})
+        c = make_client(retrieve_handler(_stream([future, *lines])))
+        outcome = c.retrieve("canary", [SPACE], reranker_id=RERANKER)
+        assert [s.code for s in outcome.statuses] == [UNKNOWN_CODE]
+        assert outcome.reranked is True
+        assert all(h.score_kind == "reranker" for h in outcome.hits)
+
+    def test_a_working_reranker_is_reported_as_reranked(self):
+        c = make_client(retrieve_handler(fixture("retrieve_reranked_ok.ndjson")))
+        passages = GoodMemRM(space_ids=[SPACE], client=c, k=2, reranker_id=RERANKER)("canary").passages
+        assert [(p.score_kind, p.score, p.raw_score) for p in passages] == [
+            ("reranker", 0.875, 0.875),
+            ("reranker", 0.25, 0.25),
+        ]
+        assert not any(p.goodmem_partial for p in passages)
+
+    def test_min_score_still_applies_to_real_reranker_scores(self):
+        c = make_client(retrieve_handler(fixture("retrieve_reranked_ok.ndjson")))
+        rm = GoodMemRM(space_ids=[SPACE], client=c, k=2, reranker_id=RERANKER, min_score=0.5)
+        assert [p.score for p in rm("canary").passages] == [0.875]
+
+    def test_without_a_reranker_nothing_is_reranked(self):
+        c = make_client(retrieve_handler(fixture("retrieve_reranked_ok.ndjson")))
+        outcome = c.retrieve("canary", [SPACE])
+        assert outcome.reranked is False
+
+
 class TestScores:
     def test_vector_scores_flip(self):
         assert orient_score(-0.51, reranked=False) == pytest.approx(0.51)
