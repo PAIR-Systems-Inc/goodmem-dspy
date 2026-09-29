@@ -17,7 +17,7 @@ from dspy_goodmem.client import GoodMemClient, GoodMemError
 from dspy_goodmem.retriever import GoodMemPassages, GoodMemRM
 from dspy_goodmem.tools import make_goodmem_tools
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = [
     "GoodMemRM",

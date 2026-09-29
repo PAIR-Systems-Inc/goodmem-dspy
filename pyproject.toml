@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dspy-goodmem"
-version = "0.2.1"
+name = "goodmem-dspy"
+version = "0.2.2"
 description = "GoodMem integration for DSPy"
 readme = "README.md"
 license = "MIT"
@@ -34,9 +34,9 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0"]
 examples = ["python-dotenv>=1.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/PAIR-Systems-Inc/dspy-goodmem"
-Repository = "https://github.com/PAIR-Systems-Inc/dspy-goodmem"
-Issues = "https://github.com/PAIR-Systems-Inc/dspy-goodmem/issues"
+Homepage = "https://github.com/PAIR-Systems-Inc/goodmem-dspy"
+Repository = "https://github.com/PAIR-Systems-Inc/goodmem-dspy"
+Issues = "https://github.com/PAIR-Systems-Inc/goodmem-dspy/issues"
 "GoodMem Docs" = "https://docs.goodmem.ai"
 
 [tool.hatch.build.targets.wheel]

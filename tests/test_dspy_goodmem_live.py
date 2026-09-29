@@ -1,4 +1,4 @@
-"""Live tests for dspy-goodmem, against a running GoodMem server.
+"""Live tests for goodmem-dspy (import package ``dspy_goodmem``), against a running GoodMem server.
 
 These skip entirely unless ``GOODMEM_API_KEY`` and ``GOODMEM_BASE_URL`` are
 set, which is also the check that no credential is baked into the package.

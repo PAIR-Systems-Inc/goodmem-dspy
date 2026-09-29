@@ -1,11 +1,22 @@
-# dspy-goodmem
+# goodmem-dspy
 
 [GoodMem](https://docs.goodmem.ai) memory for [DSPy](https://github.com/stanfordnlp/dspy):
 a retriever and a set of agent tools. Documents are chunked, embedded and
 searched server-side; this package wraps the official `goodmem` Python SDK.
 
-**Version 0.2.1.** 0.2.0 was verified against GoodMem server **v1.0.320**;
-the id checks 0.2.1 adds run before any request and are tested offline.
+**Version 0.2.2.** 0.2.0 was verified against GoodMem server **v1.0.320**;
+0.2.2 against the monthly end-to-end run (dspy 3.4.0, 17 of 17 checks).
+
+> **Renamed.** This package was previously published on PyPI as
+> `dspy-goodmem` (last version there: **0.1.1**). It moved into the PAIR
+> Systems PyPI organisation under the `goodmem-<framework>` naming used by
+> goodmem-adk and goodmem-semantic-kernel. The import name is unchanged —
+> `import dspy_goodmem`. Both distributions ship that same package, so remove
+> the old one first; installed side by side they overwrite each other's files:
+>
+> ```bash
+> pip uninstall -y dspy-goodmem && pip install goodmem-dspy
+> ```
 
 > **Upgrading from 0.1.1.** 0.1.1 talked to GoodMem over hand-written HTTP. A
 > retrieval that *failed* — a space whose embedder was unavailable, say —
@@ -16,7 +27,7 @@ the id checks 0.2.1 adds run before any request and are tested offline.
 ## Install
 
 ```bash
-pip install dspy-goodmem
+pip install goodmem-dspy
 export GOODMEM_API_KEY="gm_your_key_here"
 export GOODMEM_BASE_URL="https://your-goodmem-server"
 ```
@@ -171,9 +182,16 @@ in a different path after the check, and a `uuid.UUID` whose text is not a
 UUID is refused. A single `uuid.UUID` is accepted wherever one space id or a
 list is.
 
-## Changes in 0.2.2 (unreleased)
+## Changes in 0.2.2
 
-Both defects were found by the monthly end-to-end run against dspy 3.4.0 and
+**Renamed to `goodmem-dspy`.** The distribution moved into the PAIR Systems
+PyPI organisation under the `goodmem-<framework>` naming used by goodmem-adk
+and goodmem-semantic-kernel. `import dspy_goodmem` is unchanged; uninstall
+`dspy-goodmem` (frozen at 0.1.1) before installing `goodmem-dspy`. 0.2.0 and
+0.2.1 were tagged but never reached PyPI, so 0.2.2 is the first release of the
+0.2 line.
+
+Two defects were found by the monthly end-to-end run against dspy 3.4.0 and
 are measured below with the same script against 0.2.1 and this release: live
 against GoodMem at `localhost:8080`, and offline replaying streams captured
 from that server on 2026-09-29.
